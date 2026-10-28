@@ -180,25 +180,37 @@ async function handleMilestoneAnswer(telegramId, chatId, chosen, callbackQueryId
 }
 
 // بيبعت الرسالة المثبتة (لو تاب Pinned موجود في الشيت) ويثبتها في شات المستخدم.
-// لو التاب مش موجود أو فاضي، بيتخطى من غير أي مشكلة.
-async function showPinnedMenu(chatId) {
+// force = false (مع /start): لو فيه رسالة مثبتة بالفعل في الشات منبعتش تاني، فتتبعت مرة واحدة بس.
+// force = true (مع /menu): تتبعت وتتثبت تاني حتى لو موجودة.
+async function showPinnedMenu(chatId, force) {
   try {
     const config = await sheets.getPinnedConfig();
-    if (config) {
-      await telegram.sendAndPinMenu(chatId, config);
-    }
+    if (!config) return;
+    if (!force && (await telegram.hasPinnedMessage(chatId))) return;
+    await telegram.sendAndPinMenu(chatId, config);
   } catch (err) {
     console.error('Pinned menu error:', err);
   }
 }
 
-// لما المستخدم يدوس على زرار قسم في الرسالة المثبتة، نبعتله محتوى القسم ده
-async function handleInfoSection(chatId, sectionIndex, callbackQueryId) {
-  await telegram.answerCallbackQuery(callbackQueryId, '🌿');
+// لما المستخدم يدوس على زرار قسم في الرسالة المثبتة، نبعتله محتوى القسم ده مرة واحدة بس.
+async function handleInfoSection(telegramId, chatId, sectionIndex, callbackQueryId) {
   const config = await sheets.getPinnedConfig();
-  if (!config) return;
-  const section = config.sections[sectionIndex];
-  if (!section) return;
+  const section = config && config.sections[sectionIndex];
+  if (!section) {
+    await telegram.answerCallbackQuery(callbackQueryId, '🌿');
+    return;
+  }
+
+  const seen = await sheets.getPinnedSeen(telegramId);
+  if (seen.includes(String(sectionIndex))) {
+    await telegram.answerCallbackQuery(callbackQueryId, 'المحتوى ده اتبعت قبل كده، هتلاقيه فوق في الشات 🌿');
+    return;
+  }
+
+  await telegram.answerCallbackQuery(callbackQueryId, '🌿');
+  // بنسجّل الأول عشان لو داس مرتين ورا بعض مايتبعتش مرتين
+  await sheets.markPinnedSeen(telegramId, sectionIndex);
   await telegram.sendSectionItems(chatId, section.items);
 }
 
@@ -236,7 +248,7 @@ module.exports = async (req, res) => {
         await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id);
       } else if (type === 'info') {
         const [, sectionIndex] = parts;
-        await handleInfoSection(chatId, parseInt(sectionIndex, 10), cq.id);
+        await handleInfoSection(telegramId, chatId, parseInt(sectionIndex, 10), cq.id);
       }
       return res.status(200).send('OK');
     }
@@ -263,13 +275,14 @@ module.exports = async (req, res) => {
           'وكل 3 صفحات هيجيلك يوم مراجعة شاملة عليهم كلهم.\n\n' +
           'لو حابب توقف الإرسال اليومي مؤقتًا اكتب /stop، ولو عايز ترجعه اكتب /resume.'
       );
-      await showPinnedMenu(chatId);
+      await showPinnedMenu(chatId, false);
       return res.status(200).send('OK');
     }
 
     // أمر /menu: يبعت الرسالة المثبتة ويثبتها تاني (مفيد لو حدّثتي محتواها في الشيت)
     if (text === '/menu') {
-      await showPinnedMenu(chatId);
+      await sheets.resetPinnedSeen(telegramId);
+      await showPinnedMenu(chatId, true);
       return res.status(200).send('OK');
     }
 

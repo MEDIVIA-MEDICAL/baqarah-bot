@@ -88,13 +88,15 @@
 - `type`: `text` (نص) أو `photo` أو `video` أو `audio`. في الصور/الفيديو/الصوت، `content` بيبقى الرابط المباشر (raw)، و`caption` تعليق اختياري تحته.
 - النصوص الطويلة بتتقسم تلقائيًا على أكتر من رسالة لو عدّت حد تيليجرام.
 - **مهم:** ضيفي الأقسام الجديدة **في آخر الشيت** (تحت الأقسام الموجودة)، عشان ترتيب الأزرار في الرسائل المثبتة اللي اتبعتت قبل كده ميتلخبطش.
-- المستخدم بيستلم الرسالة المثبتة تلقائيًا بعد `/start`. ولو عدّلتي المحتوى وعايزة النسخة الجديدة، يكتب `/menu` والبوت يبعتها ويثبتها تاني.
+- الرسالة المثبتة بتتبعت **مرة واحدة بس** في أول `/start` (لو فيه رسالة مثبتة بالفعل في الشات، البوت مش بيبعتها تاني).
+- محتوى كل قسم بيتبعت **مرة واحدة لكل مستخدم**. لو داس على الزرار تاني، بيظهرله تنبيه صغير إن المحتوى اتبعت فوق في الشات بدل ما يتكرر. البوت بيفتكر ده في عمود `pinned_seen` في تاب `Progress` (لازم تضيفي العمود ده، ولو مش موجود المحتوى هيتبعت كل مرة).
+- لو عدّلتي المحتوى وعايزة النسخة الجديدة، المستخدم يكتب `/menu`: البوت يبعت الرسالة المثبتة ويثبتها تاني ويصفّر اللي شافه، فيقدر يستلم المحتوى من الأول.
 - لو التاب ده مش موجود أو فاضي، البوت يتخطى الخطوة دي عادي.
 
 ### تاب اسمه `Progress`
 سيبيه فاضي غير الصف الأول (العناوين) — البوت هو اللي هيملاه لوحده، متكتبيش فيه حاجة يدوي:
 
-`telegram_id | chat_id | name | current_page | subscribed | last_sent_date | cycle_day | block_start_page | review_queue | review_question_index | review_score | pending_choice | milestone_page | milestone_queue | milestone_question_index | milestone_score | pending_resume_day`
+`telegram_id | chat_id | name | current_page | subscribed | last_sent_date | cycle_day | block_start_page | review_queue | review_question_index | review_score | pending_choice | milestone_page | milestone_queue | milestone_question_index | milestone_score | pending_resume_day | pinned_seen`
 
 ## الخطوة 3: ربط Google Sheet بالبوت (Service Account)
 1. روحي على [Google Cloud Console](https://console.cloud.google.com/) واعملي مشروع جديد.
@@ -167,4 +169,3 @@ https://api.telegram.org/bot<التوكن>/setWebhook?url=https://baqarah-bot.ve
 "schedule": "0 4 * * *"
 ```
 الرقم الأول (4) هو الساعة بتوقيت UTC (اطرحي/اضيفي فرق التوقيت بتاعك).
-
