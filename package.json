@@ -1,0 +1,16 @@
+{
+  "name": "baqarah-memorization-bot",
+  "version": "1.0.0",
+  "description": "بوت تيليجرام لمساعدة الناس على حفظ سورة البقرة بأسلوب الخرائط الذهنية",
+  "main": "api/webhook.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "setup-webhook": "node scripts/set-webhook.js"
+  },
+  "dependencies": {
+    "google-spreadsheet": "^4.1.4",
+    "google-auth-library": "^9.15.0"
+  }
+}
