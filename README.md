@@ -44,7 +44,7 @@
 **ملحوظة عن روابط تيليجرام:** لو الفيديو أو الصوت هتاخديه من قناة تيليجرام، خدي رابط الملف نفسه (لو متاح كرابط مباشر تحميل)، أو ارفعيه على مكان استضافة ملفات (زي نفس postimages بس لملفات صوت/فيديو ممكن تستخدمي حاجة زي Google Drive بصلاحية "أي حد عنده الرابط")، لأن روابط تيليجرام العادية (t.me/...) مش هتشتغل مباشرة كرابط تحميل للبوت.
 
 ### تاب اسمه `Quiz`
-`page_number | question_type | question | option_a | option_b | option_c | option_d | correct_option`
+`page_number | question_type | question | option_a | option_b | option_c | option_d | correct_option | explanation`
 
 | page_number | question_type | question | option_a | option_b | option_c | option_d | correct_option |
 |---|---|---|---|---|---|---|---|
@@ -59,7 +59,7 @@
 ### تاب جديد اسمه `Milestones` (اختياري)
 لاختبارات إضافية بعد صفحات معينة تختاريها إنتِ (زي 21، 41، 49) - مستقلة تمامًا عن دورة الـ7 أيام والمراجعة العادية.
 
-`milestone_page | question | option_a | option_b | option_c | option_d | correct_option`
+`milestone_page | question | option_a | option_b | option_c | option_d | correct_option | explanation`
 
 | milestone_page | question | option_a | option_b | option_c | option_d | correct_option |
 |---|---|---|---|---|---|---|
@@ -68,6 +68,7 @@
 | 49 | سؤال على السورة كلها | اختيار أ | اختيار ب | اختيار ج | | a |
 
 - تقدري تسيبي `option_d` فاضي لو عايزة 3 اختيارات بس (أو حتى اتنين) — البوت بيتخطى أي اختيار فاضي تلقائيًا.
+- **`explanation` (اختياري): تعليق على الإجابة.** اكتبي فيه كلام بسيط يظهر للمستخدم بعد ما يجاوب على السؤال، تحت علامة 💡. لو الإجابة غلط بيظهر معاه الإجابة الصحيحة. لو سيبتيه فاضي، بيظهر بس صح أو غلط. العمود ده في تابين: `Quiz` و`Milestones`.
 - ضيفي كل الأسئلة اللي عايزاها بنفس `milestone_page`، هيتجمعوا كلهم مع بعض كاختبار واحد.
 - الاختبار ده بيظهر كـ**يوم إضافي** بعد يوم التثبيت العادي بتاع نفس الصفحة (يعني لو صفحة 21 جالها يوم تثبيت، هيجيلها بعده مباشرة يوم اختبار المحطة، وبعدين يكمل الدورة عادي).
 - **مفيش أي إيقاف على النتيجة** — البوت بيعرض النتيجة بس ويكمل عادي، أي النتيجة طلعت.

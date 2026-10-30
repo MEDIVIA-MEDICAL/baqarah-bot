@@ -15,12 +15,7 @@ async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryI
     callbackQueryId,
     correct ? '✅ إجابة صحيحة!' : '❌ إجابة غير صحيحة'
   );
-  await telegram.sendMessage(
-    chatId,
-    correct
-      ? '🎉 برافو! إجابة صحيحة، استمر في الحفظ.'
-      : `الإجابة الصحيحة كانت: ${quiz.correct}) ${quiz.options[quiz.correct]}`
-  );
+  await telegram.sendAnswerFeedback(chatId, quiz, correct, '🎉 برافو! إجابة صحيحة');
 }
 
 // تأكيد "سمّعتها" لسؤال إكمال الآية في يوم التثبيت - مفيهوش تصحيح، مجرد تشجيع
@@ -132,6 +127,8 @@ async function handleReviewAnswer(telegramId, chatId, chosen, callbackQueryId) {
 
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
+  // لو السؤال ليه تعليق في الشيت نعرضه قبل السؤال اللي بعده
+  if (quiz.explanation) await telegram.sendAnswerFeedback(chatId, quiz, correct);
   await advanceReview(telegramId, chatId, correct ? 1 : 0);
 }
 
@@ -153,6 +150,7 @@ async function handleMilestoneAnswer(telegramId, chatId, chosen, callbackQueryId
 
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
+  if (quiz.explanation) await telegram.sendAnswerFeedback(chatId, quiz, correct);
 
   const newScore = user.milestoneScore + (correct ? 1 : 0);
   const newIndex = user.milestoneQuestionIndex + 1;
@@ -276,7 +274,9 @@ module.exports = async (req, res) => {
           'وكل 3 صفحات هيجيلك يوم مراجعة شاملة عليهم كلهم.\n\n' +
           'لو حابب توقف الإرسال اليومي مؤقتًا اكتب /stop، ولو عايز ترجعه اكتب /resume.'
       );
-      await showPinnedMenu(chatId, false);
+      // مستخدم جديد: نبعت المثبت دايمًا (حتى لو تيليجرام لسه فاكر مثبت قديم بعد مسح الشات)
+      // مستخدم قديم عمل /start تاني: ما نبعتهوش لو عنده مثبت بالفعل
+      await showPinnedMenu(chatId, user.isNew);
       // مستخدم جديد: أول صفحة تتبعت فورًا، وباقي الأيام الكرون يبعتها الساعة 7
       if (user.isNew) {
         await deliverFirstPage(user, new Date().toISOString().slice(0, 10));
