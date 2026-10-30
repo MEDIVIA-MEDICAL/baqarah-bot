@@ -15,6 +15,7 @@
 
 const sheets = require('../lib/sheets');
 const telegram = require('../lib/telegram');
+const { sendNewPageDay, progressAfterNewPage } = require('../lib/daily');
 
 function shuffle(array) {
   const arr = [...array];
@@ -23,20 +24,6 @@ function shuffle(array) {
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
-}
-
-async function sendNewPageDay(user) {
-  const content = await sheets.getContentForPage(user.currentPage);
-  if (!content) {
-    // خلصت الصفحات المتاحة في الشيت لحد دلوقتي
-    return false;
-  }
-  const motivation = await sheets.getRandomMotivation();
-  if (motivation) {
-    await telegram.sendMotivation(user.chatId, motivation);
-  }
-  await telegram.sendDailyPage(user.chatId, content);
-  return true;
 }
 
 async function sendQuickCheckDay(user) {
@@ -266,8 +253,7 @@ module.exports = async (req, res) => {
         const sent = await sendNewPageDay(user);
         if (!sent) continue; // خلصت الصفحات، متتحركش
         // يوم 1 هو أول يوم في البلوك، نسجل بداية البلوك هنا
-        const updates = { cycleDay: day + 1, lastSentDate: todayStr };
-        if (day === 1) updates.blockStartPage = user.currentPage;
+        const updates = { ...progressAfterNewPage(user, day), lastSentDate: todayStr };
         await sheets.updateUserFields(user.telegramId, updates);
       } else {
         // يوم تثبيت (2 أو 4 أو 6)

@@ -4,6 +4,7 @@
 
 const sheets = require('../lib/sheets');
 const telegram = require('../lib/telegram');
+const { deliverFirstPage } = require('../lib/daily');
 
 // إجابة سؤال تثبيت من نوع اختيارات (يوم 2/4/6)
 async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryId) {
@@ -265,7 +266,7 @@ module.exports = async (req, res) => {
     const text = msg.text.trim();
 
     if (text === '/start') {
-      await sheets.upsertUser({ telegramId, chatId, name, startPage: 1 });
+      const user = await sheets.upsertUser({ telegramId, chatId, name, startPage: 1 });
       await telegram.sendMessage(
         chatId,
         `أهلًا بيك يا ${name} 🌿\n\n` +
@@ -276,6 +277,10 @@ module.exports = async (req, res) => {
           'لو حابب توقف الإرسال اليومي مؤقتًا اكتب /stop، ولو عايز ترجعه اكتب /resume.'
       );
       await showPinnedMenu(chatId, false);
+      // مستخدم جديد: أول صفحة تتبعت فورًا، وباقي الأيام الكرون يبعتها الساعة 7
+      if (user.isNew) {
+        await deliverFirstPage(user, new Date().toISOString().slice(0, 10));
+      }
       return res.status(200).send('OK');
     }
 
