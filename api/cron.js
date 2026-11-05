@@ -27,7 +27,7 @@ function shuffle(array) {
 }
 
 async function sendQuickCheckDay(user) {
-  const quiz = await sheets.getFirstQuizForPage(user.currentPage);
+  const quiz = await sheets.getQuizRawsForPage(user.currentPage);
   if (!quiz) {
     await telegram.sendMessage(
       user.chatId,
