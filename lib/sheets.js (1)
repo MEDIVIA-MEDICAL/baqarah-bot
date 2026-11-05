@@ -1,0 +1,487 @@
+// lib/sheets.js
+// كل dealing مع Google Sheet من مكان واحد (google-spreadsheet + Service Account).
+//
+// عشان البوت يستحمل أي عدد من المستخدمين من غير ما يضغط على Google Sheets API،
+// كل التابات (Content/Quiz/Motivation/Milestones/Pinned) بتتقرى مرة واحدة
+// وتتحفظ في كاش (Redis لو متظبط، أو in-memory) لمدة 5 دقايق،
+// وتاب الـ Progress بيتقرى كل بضع ثواني داخل نفس الـ instance. وكل كتابة
+// على تقدم المستخدم بتحدّث الكاش فورًا (write-through) عشان ما فيش تعارض.
+
+const { GoogleSpreadsheet } = require('google-spreadsheet');
+const { JWT } = require('google-auth-library');
+const redis = require('./redis');
+
+const SHEET_ID = () => process.env.GOOGLE_SHEET_ID;
+
+let jwt = null;
+let doc = null;
+
+function getJwt() {
+  if (!jwt) {
+    const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+    const key = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+    if (!email || !key) throw new Error('GOOGLE_SERVICE_ACCOUNT_EMAIL / GOOGLE_PRIVATE_KEY مش متظبطين');
+    jwt = new JWT({ email, key, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+  }
+  return jwt;
+}
+
+async function getDoc() {
+  if (!doc) {
+    if (!SHEET_ID()) throw new Error('GOOGLE_SHEET_ID مش متظبط');
+    doc = new GoogleSpreadsheet(SHEET_ID(), getJwt());
+    await doc.loadInfo();
+  }
+  return doc;
+}
+
+// ---------- كاش ----------
+
+const memoryCache = new Map(); // key -> { value, expiresAt }
+const CONTENT_TTL = 300; // ثواني لتابات المحتوى
+const PROGRESS_TTL = 2; // ثواني لكاش الـ Progress داخل نفس الـ instance
+
+async function cacheGet(key) {
+  try {
+    const v = await redis.get(key);
+    if (v !== null && v !== undefined) return JSON.parse(v);
+  } catch (err) {
+    // Redis مش متظبط أو واقع: هن falls back على in-memory
+  }
+  const m = memoryCache.get(key);
+  if (m && m.expiresAt > Date.now()) return m.value;
+  return null;
+}
+
+async function cacheSet(key, value, ttlSeconds) {
+  memoryCache.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
+  try {
+    await redis.set(key, JSON.stringify(value), ttlSeconds);
+  } catch (err) {
+    // in-memory بس
+  }
+}
+
+async function cacheDel(key) {
+  memoryCache.delete(key);
+  try {
+    await redis.del(key);
+  } catch (err) {}
+}
+
+// ---------- قراءة التابات ----------
+
+const norm = (s) => String(s == null ? '' : s).trim();
+
+async function getSheetByTitle(title) {
+  const d = await getDoc();
+  return d.sheetsByTitle[title] || null;
+}
+
+//icroطبع صفوف تاب ك entfernen كائنات بمفاتيح impératriceした headers بعد trim
+async function readTabRaw(title) {
+  const sheet = await getSheetByTitle(title);
+  if (!sheet) return [];
+  await sheet.loadHeaderRow();
+  const headers = sheet.headerValues.map(norm);
+  const rows = await sheet.getRows();
+  return rows.map((r) => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = norm(r._rawData ? r._rawData[i] : r[h]);
+    });
+    return obj;
+  });
+}
+
+// قراءة تاب محتوى مع كاش
+async function getTabRows(title) {
+  const key = `sht:tab:${title}`;
+  const cached = await cacheGet(key);
+  if (cached) return cached;
+  const rows = await readTabRaw(title);
+  await cacheSet(key, rows, CONTENT_TTL);
+  return rows;
+}
+
+async function clearContentCache() {
+  for (const tab of ['Content', 'Quiz', 'Motivation', 'Milestones', 'Pinned']) {
+    await cacheDel(`sht:tab:${tab}`);
+  }
+  progressCache.at = 0;
+  progressCache.rows = null;
+}
+
+// ---------- Progress ----------
+
+const COLS = {
+  telegramId: 'telegram_id',
+  chatId: 'chat_id',
+  name: 'name',
+  currentPage: 'current_page',
+  subscribed: 'subscribed',
+  lastSentDate: 'last_sent_date',
+  cycleDay: 'cycle_day',
+  blockStartPage: 'block_start_page',
+  reviewQueue: 'review_queue',
+  reviewQuestionIndex: 'review_question_index',
+  reviewScore: 'review_score',
+  pendingChoice: 'pending_choice',
+  milestonePage: 'milestone_page',
+  milestoneQueue: 'milestone_queue',
+  milestoneQuestionIndex: 'milestone_question_index',
+  milestoneScore: 'milestone_score',
+  pendingResumeDay: 'pending_resume_day',
+  pinnedSeen: 'pinned_seen',
+  completed: 'completed',
+};
+const COL_TO_FIELD = Object.fromEntries(Object.entries(COLS).map(([f, c]) => [c, f]));
+
+const toBool = (v) => v === 'TRUE' || v === 'true' || v === '1' || v === true;
+const toInt = (v, d = 0) => {
+  const n = parseInt(v, 10);
+  return Number.isNaN(n) ? d : n;
+};
+const toArr = (v) => {
+  if (Array.isArray(v)) return v;
+  if (!v) return [];
+  try {
+    const p = JSON.parse(v);
+    return Array.isArray(p) ? p : [];
+  } catch {
+    return v.split(',').map((x) => x.trim()).filter(Boolean);
+  }
+};
+
+function parseUser(row) {
+  return {
+    telegramId: norm(row.telegram_id),
+    chatId: norm(row.chat_id),
+    name: norm(row.name),
+    currentPage: toInt(row.current_page, 1),
+    subscribed: toBool(row.subscribed),
+    lastSentDate: norm(row.last_sent_date),
+    cycleDay: toInt(row.cycle_day, 1),
+    blockStartPage: toInt(row.block_start_page, 1),
+    reviewQueue: toArr(row.review_queue),
+    reviewQuestionIndex: toInt(row.review_question_index, 0),
+    reviewScore: toInt(row.review_score, 0),
+    pendingChoice: norm(row.pending_choice),
+    milestonePage: norm(row.milestone_page),
+    milestoneQueue: toArr(row.milestone_queue),
+    milestoneQuestionIndex: toInt(row.milestone_question_index, 0),
+    milestoneScore: toInt(row.milestone_score, 0),
+    pendingResumeDay: norm(row.pending_resume_day),
+    pinnedSeen: toArr(row.pinned_seen).map((x) => parseInt(x, 10)).filter((x) => !Number.isNaN(x)),
+    completed: toBool(row.completed),
+  };
+}
+
+function serializeField(field, value) {
+  if (Array.isArray(value)) return JSON.stringify(value);
+  if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE';
+  return String(value);
+}
+
+// كاش Progress per-instance (TTL قصير جدًا) عشان reducing reads مع波同时 keeping fresh enough
+let progressCache = { at: 0, rows: null };
+
+async function getProgressRows() {
+  const now = Date.now();
+  if (progressCache.rows && now - progressCache.at < PROGRESS_TTL * 1000) return progressCache.rows;
+  const rows = await readTabRaw('Progress');
+  progressCache = { at: now, rows };
+  return rows;
+}
+
+function invalidateProgressCache() {
+  progressCache.at = 0;
+  progressCache.rows = null;
+}
+
+async function getUserProgress(telegramId) {
+  const rows = await getProgressRows();
+  const row = rows.find((r) => norm(r.telegram_id) === String(telegramId));
+  return row ? parseUser(row) : null;
+}
+
+async function getAllUsers() {
+  return (await getProgressRows()).map(parseUser);
+}
+
+async function getAllSubscribedUsers() {
+  return (await getAllUsers()).filter((u) => u.subscribed);
+}
+
+// كتابة تحديثات على صف مستخدم موجود (write-through للكاش)
+async function updateUserFields(telegramId, fields) {
+  const sheet = await getSheetByTitle('Progress');
+  if (!sheet) throw new Error('تاب Progress مش موجود');
+  const rows = await sheet.getRows();
+  const row = rows.find((r) => norm(r.telegram_id) === String(telegramId));
+  if (!row) throw new Error(`مستخدم ${telegramId} مش موجود في Progress`);
+  for (const [field, value] of Object.entries(fields)) {
+    const col = COLS[field];
+    if (!col) continue;
+    row[col] = serializeField(field, value);
+  }
+  await row.save();
+  invalidateProgressCache();
+}
+
+async function setSubscribed(telegramId, value) {
+  await updateUserFields(telegramId, { subscribed: value });
+}
+
+// إنشاء مستخدم جديد أو تحديث chat_id/name لو موجود. بيرجع { ...user, isNew }
+async function upsertUser({ telegramId, chatId, name, startPage = 1 }) {
+  const sheet = await getSheetByTitle('Progress');
+  if (!sheet) throw new Error('تاب Progress مش موجود');
+  const rows = await sheet.getRows();
+  const existing = rows.find((r) => norm(r.telegram_id) === String(telegramId));
+  if (existing) {
+    existing.chat_id = String(chatId);
+    if (name) existing.name = name;
+    await existing.save();
+    invalidateProgressCache();
+    return { ...parseUser(existing.toObject ? existing.toObject() : existing), isNew: false };
+  }
+  const defaults = {
+    telegram_id: String(telegramId),
+    chat_id: String(chatId),
+    name: name || '',
+    current_page: String(startPage),
+    subscribed: 'TRUE',
+    last_sent_date: '',
+    cycle_day: '1',
+    block_start_page: String(startPage),
+    review_queue: '[]',
+    review_question_index: '0',
+    review_score: '0',
+    pending_choice: '',
+    milestone_page: '',
+    milestone_queue: '[]',
+    milestone_question_index: '0',
+    milestone_score: '0',
+    pending_resume_day: '',
+    pinned_seen: '[]',
+    completed: 'FALSE',
+  };
+  await sheet.addRow(defaults);
+  invalidateProgressCache();
+  return { ...parseUser(defaults), isNew: true };
+}
+
+async function resetUser(telegramId) {
+  await updateUserFields(telegramId, {
+    currentPage: 1,
+    subscribed: true,
+    lastSentDate: '',
+    cycleDay: 1,
+    blockStartPage: 1,
+    reviewQueue: [],
+    reviewQuestionIndex: 0,
+    reviewScore: 0,
+    pendingChoice: '',
+    milestonePage: '',
+    milestoneQueue: [],
+    milestoneQuestionIndex: 0,
+    milestoneScore: 0,
+    pendingResumeDay: '',
+    pinnedSeen: [],
+    completed: false,
+  });
+}
+
+// ---------- Content ----------
+
+function rowToContent(row) {
+  return {
+    pageNumber: toInt(row.page_number, 0),
+    versesRange: norm(row.verses_range),
+    quranPageImageUrl: norm(row.quran_page_image_url),
+    videoUrl: norm(row.video_url),
+    audioUrl: norm(row.audio_url),
+    audioUrl2: norm(row.audio_url_2),
+    mindmapImageUrl: norm(row.mindmap_image_url),
+    tafsirText: norm(row.tafsir_text),
+  };
+}
+
+async function getContentForPage(page) {
+  const rows = await getTabRows('Content');
+  const row = rows.find((r) => toInt(r.page_number, -1) === Number(page));
+  return row ? rowToContent(row) : null;
+}
+
+async function getMaxPage() {
+  const rows = await getTabRows('Content');
+  return rows.reduce((m, r) => Math.max(m, toInt(r.page_number, 0)), 0);
+}
+
+async function isBeyondLastPage(page) {
+  return Number(page) > (await getMaxPage());
+}
+
+async function getRandomMotivation() {
+  const rows = await getTabRows('Motivation');
+  const msgs = rows.map((r) => norm(r.message)).filter(Boolean);
+  if (msgs.length === 0) return null;
+  return msgs[Math.floor(Math.random() * msgs.length)];
+}
+
+// ---------- Quiz ----------
+
+function rowToQuiz(row, occurrence) {
+  return {
+    pageNumber: toInt(row.page_number, 0),
+    occurrence,
+    type: norm(row.question_type).toLowerCase() === 'complete' ? 'complete' : 'mcq',
+    question: norm(row.question),
+    options: {
+      a: norm(row.option_a),
+      b: norm(row.option_b),
+      c: norm(row.option_c),
+      d: norm(row.option_d),
+    },
+    correct: norm(row.correct_option).toLowerCase(),
+    explanation: norm(row.explanation),
+  };
+}
+
+async function getQuizRowsForPage(page) {
+  const rows = await getTabRows('Quiz');
+  return rows
+    .filter((r) => toInt(r.page_number, -1) === Number(page))
+    .map((r, i) => rowToQuiz(r, i));
+}
+
+async function getQuizRowsForPages(pages) {
+  const rows = await getTabRows('Quiz');
+  const counts = {};
+  return rows
+    .filter((r) => pages.map(Number).includes(toInt(r.page_number, -1)))
+    .map((r) => {
+      const p = toInt(r.page_number, 0);
+      const occ = counts[p] || 0;
+      counts[p] = occ + 1;
+      return rowToQuiz(r, occ);
+    });
+}
+
+async function getQuizByPageOccurrence(page, occurrence) {
+  const rows = await getQuizRowsForPage(page);
+  return rows[occurrence] || null;
+}
+
+// ---------- Milestones ----------
+
+async function getMilestoneQuizRows(page) {
+  const rows = await getTabRows('Milestones');
+  return rows
+    .filter((r) => toInt(r.milestone_page, -1) === Number(page))
+    .map((r, i) => ({
+      occurrence: i,
+      question: norm(r.question),
+      options: {
+        a: norm(r.option_a),
+        b: norm(r.option_b),
+        c: norm(r.option_c),
+        d: norm(r.option_d),
+      },
+      correct: norm(r.correct_option).toLowerCase(),
+      explanation: norm(r.explanation),
+    }));
+}
+
+async function getMilestoneQuizByOccurrence(page, occurrence) {
+  const rows = await getMilestoneQuizRows(page);
+  return rows[occurrence] || null;
+}
+
+// ---------- Pinned ----------
+
+async function getPinnedConfig() {
+  const rows = await getTabRows('Pinned');
+  if (rows.length === 0) return null;
+  let introText = '';
+  const sections = [];
+  const byName = new Map();
+  for (const r of rows) {
+    const section = norm(r.section);
+    const order = toInt(r.order, 0);
+    const type = norm(r.type).toLowerCase() || 'text';
+    const content = norm(r.content);
+    const caption = norm(r.caption);
+    if (section === '_pinned') {
+      introText = content;
+      continue;
+    }
+    if (!byName.has(section)) {
+      const s = { name: section, items: [] };
+      byName.set(section, s);
+      sections.push(s);
+    }
+    byName.get(section).items.push({ order, type, content, caption });
+  }
+  for (const s of sections) s.items.sort((x, y) => x.order - y.order);
+  if (!introText && sections.length === 0) return null;
+  return { introText, sections };
+}
+
+// يسجّل إن المستخدم شاف القسم ده، ويرجع true لأول مرة بس
+async function markPinnedSeen(telegramId, sectionIndex) {
+  const user = await getUserProgress(telegramId);
+  if (!user) return false;
+  if (user.pinnedSeen.includes(sectionIndex)) return false;
+  await updateUserFields(telegramId, { pinnedSeen: [...user.pinnedSeen, sectionIndex] });
+  return true;
+}
+
+async function resetPinnedSeen(telegramId) {
+  await updateUserFields(telegramId, { pinnedSeen: [] });
+}
+
+// ---------- Snapshot ----------
+
+// لقطة يومية لتقرير التقدم (تاب ProgressSnapshot لو موجود)
+async function exportProgressSnapshot(all) {
+  const sheet = await getSheetByTitle('ProgressSnapshot');
+  if (!sheet) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = all.map((u) => ({
+    date: today,
+    telegram_id: u.telegramId,
+    name: u.name,
+    current_page: String(u.currentPage),
+    cycle_day: String(u.cycleDay),
+    subscribed: u.subscribed ? 'TRUE' : 'FALSE',
+    completed: u.completed ? 'TRUE' : 'FALSE',
+  }));
+  for (const r of rows) await sheet.addRow(r);
+}
+
+module.exports = {
+  getTabRows,
+  clearContentCache,
+  getUserProgress,
+  getAllUsers,
+  getAllSubscribedUsers,
+  updateUserFields,
+  setSubscribed,
+  upsertUser,
+  resetUser,
+  getContentForPage,
+  getMaxPage,
+  isBeyondLastPage,
+  getRandomMotivation,
+  getQuizRowsForPage,
+  getQuizRowsForPages,
+  getQuizByPageOccurrence,
+  getMilestoneQuizRows,
+  getMilestoneQuizByOccurrence,
+  getPinnedConfig,
+  markPinnedSeen,
+  resetPinnedSeen,
+  exportProgressSnapshot,
+};
