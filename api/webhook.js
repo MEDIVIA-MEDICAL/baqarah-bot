@@ -7,15 +7,15 @@ const telegram = require('../lib/telegram');
 const { deliverFirstPage } = require('../lib/daily');
 
 // إجابة سؤال تثبيت من نوع اختيارات (يوم 2/4/6)
-async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryId) {
-  const quiz = await sheets.getFirstQuizForPage(pageNumber);
+async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryId, occurrence = 0) {
+  const quiz = await sheets.getQuizByPageOccurrence(pageNumber, occurrence);
   if (!quiz) return;
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(
     callbackQueryId,
     correct ? '✅ إجابة صحيحة!' : '❌ إجابة غير صحيحة'
   );
-  await telegram.sendAnswerFeedback(chatId, quiz, correct, '🎉 برافو! إجابة صحيحة');
+  await telegram.sendAnswerFeedback(chatId, quiz, correct, '🎉 ممتاز! إجابة صحيحة');
 }
 
 // تأكيد "سمّعتها" لسؤال إكمال الآية في يوم التثبيت - مفيهوش تصحيح، مجرد تشجيع
@@ -213,6 +213,96 @@ async function handleInfoSection(telegramId, chatId, sectionIndex, callbackQuery
   await telegram.sendSectionItems(chatId, section.items);
 }
 
+// ---------- أوامر المعاينة (ليكي إنتي بس) ----------
+// OWNER_TELEGRAM_ID: متغير في Vercel فيه رقم تيليجرام بتاعك (ممكن أكتر من رقم مفصولين بفاصلة).
+// الأوامر دي مش بتلمس تقدم أي مستخدم ومش بتكتب حاجة في الشيت.
+function isOwner(telegramId) {
+  const ids = String(process.env.OWNER_TELEGRAM_ID || '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  return ids.includes(String(telegramId));
+}
+
+// /preview 5  -> يبعتلك محتوى صفحة 5 كاملًا زي ما بيوصل للمستخدمين
+// /quiz 5     -> يبعتلك كل أسئلة صفحة 5 بأزرارها (جرّبي تجاوبي وشوفي الرد)
+// /quiz m21   -> نفس الحاجة لأسئلة اختبار محطة صفحة 21
+async function handleOwnerPreview(cmd, arg, chatId) {
+  if (!arg) {
+    await telegram.sendMessage(chatId, 'اكتبي الأمر مع رقم الصفحة، مثلًا: /preview 5 أو /quiz 5 أو /quiz m21');
+    return;
+  }
+
+  // نمسح الكاش عشان تشوفي أحدث تعديل في الشيت
+  sheets.clearTabCache();
+
+  if (cmd === '/preview') {
+    const content = await sheets.getContentForPage(parseInt(arg, 10));
+    if (!content) {
+      await telegram.sendMessage(chatId, `مفيش محتوى لصفحة ${arg} في تاب Content.`);
+      return;
+    }
+    await telegram.sendDailyPage(chatId, content);
+    return;
+  }
+
+  // /quiz
+  const isMilestone = /^m/i.test(arg);
+  const page = arg.replace(/^m/i, '');
+  const quizzes = isMilestone
+    ? await sheets.getMilestoneQuizRows(page)
+    : await sheets.getQuizRowsForPage(page);
+
+  if (quizzes.length === 0) {
+    await telegram.sendMessage(chatId, `مفيش أسئلة جاهزة ${isMilestone ? 'للمحطة' : 'لصفحة'} ${page}.`);
+    return;
+  }
+
+  const prefix = isMilestone ? 'm' : '';
+  for (let occ = 0; occ < quizzes.length; occ++) {
+    const quiz = quizzes[occ];
+    const title = `🧪 <b>معاينة سؤال ${occ + 1}/${quizzes.length} (${isMilestone ? 'محطة ' : 'صفحة '}${page}):</b>`;
+    if (quiz.type === 'complete') {
+      await telegram.sendMessage(chatId, `${title}\n🎙️ ${quiz.question}`, {
+        reply_markup: {
+          inline_keyboard: [[{ text: '✅ سمّعتها', callback_data: `quickdone:${page}:0` }]],
+        },
+      });
+      continue;
+    }
+    const buttons = Object.entries(quiz.options)
+      .filter(([, text]) => text)
+      .map(([key, text]) => [
+        { text: `${key}) ${text}`, callback_data: `qprev:${prefix}${page}:${occ}:${key}` },
+      ]);
+    await telegram.sendMessage(chatId, `${title}\n${quiz.question}`, {
+      reply_markup: { inline_keyboard: buttons },
+    });
+  }
+}
+
+// إجابة سؤال معاينة: بتقيّم وتعرض نفس رد المستخدمين، من غير ما تغيّر أي تقدم
+async function handleQuizPreviewAnswer(telegramId, chatId, parts, callbackQueryId) {
+  if (!isOwner(telegramId)) {
+    await telegram.answerCallbackQuery(callbackQueryId, '🌿');
+    return;
+  }
+  const [, pageRaw, occRaw, chosen] = parts;
+  const isMilestone = /^m/i.test(pageRaw);
+  const page = pageRaw.replace(/^m/i, '');
+  const occ = parseInt(occRaw, 10);
+  const quiz = isMilestone
+    ? await sheets.getMilestoneQuizByOccurrence(page, occ)
+    : await sheets.getQuizByPageOccurrence(page, occ);
+  if (!quiz) {
+    await telegram.answerCallbackQuery(callbackQueryId, 'السؤال مش موجود، جرّبي /quiz تاني');
+    return;
+  }
+  const correct = chosen === quiz.correct;
+  await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
+  await telegram.sendAnswerFeedback(chatId, quiz, correct);
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(200).send('OK - webhook is alive');
@@ -230,8 +320,11 @@ module.exports = async (req, res) => {
       const type = parts[0];
 
       if (type === 'quick') {
-        const [, pageNumber, chosen] = parts;
-        await handleQuickCheckAnswer(chatId, pageNumber, chosen, cq.id);
+        // الصيغة الجديدة quick:الصفحة:ترتيب_السؤال:الاختيار (والقديمة quick:الصفحة:الاختيار لسه شغالة)
+        const pageNumber = parts[1];
+        const occurrence = parts.length >= 4 ? parseInt(parts[2], 10) || 0 : 0;
+        const chosen = parts.length >= 4 ? parts[3] : parts[2];
+        await handleQuickCheckAnswer(chatId, pageNumber, chosen, cq.id, occurrence);
       } else if (type === 'quickdone') {
         await handleQuickCheckDone(chatId, cq.id);
       } else if (type === 'review') {
@@ -245,6 +338,8 @@ module.exports = async (req, res) => {
       } else if (type === 'milestone') {
         const [, chosen] = parts;
         await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id);
+      } else if (type === 'qprev') {
+        await handleQuizPreviewAnswer(telegramId, chatId, parts, cq.id);
       } else if (type === 'info') {
         const [, sectionIndex] = parts;
         await handleInfoSection(telegramId, chatId, parseInt(sectionIndex, 10), cq.id);
@@ -262,6 +357,14 @@ module.exports = async (req, res) => {
     const telegramId = msg.from.id;
     const name = msg.from.first_name || '';
     const text = msg.text.trim();
+
+    // أوامر المعاينة: شغالة لحسابك إنتي بس، وأي حد تاني بيكمل عادي في الردود اللي تحت
+    const [rawCmd, cmdArg] = text.split(/\s+/);
+    const cmd = rawCmd.split('@')[0].toLowerCase();
+    if ((cmd === '/preview' || cmd === '/quiz') && isOwner(telegramId)) {
+      await handleOwnerPreview(cmd, cmdArg, chatId);
+      return res.status(200).send('OK');
+    }
 
     if (text === '/start') {
       const user = await sheets.upsertUser({ telegramId, chatId, name, startPage: 1 });

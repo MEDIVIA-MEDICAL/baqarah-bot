@@ -52,18 +52,22 @@ function shuffle(array) {
 }
 
 async function sendQuickCheckDay(user) {
-  const quiz = await sheets.getFirstQuizForPage(user.currentPage);
-  if (!quiz) {
+  // كل أسئلة الصفحة بالترتيب اللي في الشيت (مش أول سؤال بس)
+  const quizzes = await sheets.getQuizRowsForPage(user.currentPage);
+  if (quizzes.length === 0) {
     await telegram.sendMessage(
       user.chatId,
       `🔁 راجع صفحة ${user.currentPage} تاني كويس النهاردة قبل ما نكمل.`
     );
     return;
   }
-  if (quiz.type === 'complete') {
-    await telegram.sendSelfCheck(user.chatId, quiz, `quickdone:${user.currentPage}:0`);
-  } else {
-    await telegram.sendQuickCheck(user.chatId, quiz, user.currentPage);
+  for (let occ = 0; occ < quizzes.length; occ++) {
+    const quiz = quizzes[occ];
+    if (quiz.type === 'complete') {
+      await telegram.sendSelfCheck(user.chatId, quiz, `quickdone:${user.currentPage}:${occ}`);
+    } else {
+      await telegram.sendQuickCheck(user.chatId, quiz, user.currentPage, occ);
+    }
   }
 }
 
