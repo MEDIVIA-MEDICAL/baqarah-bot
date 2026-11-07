@@ -31,6 +31,17 @@ const TIME_BUDGET_MS = 45 * 1000;
 const CONCURRENCY = 3; // عدد المستخدمين اللي بيتعالجوا مع بعض (قليل عشان حدود جوجل وتيليجرام)
 const MAX_CHAIN_DEPTH = 40; // حماية من أي تسلسل لا نهائي
 
+// آخر صفحة في المحتوى (سورة البقرة بتخلص في صفحة 49). أول ما المستخدم يخلّص مراجعة آخر بلوك
+// ويوصل لصفحة بعدها، بيستلم رسالة الختام مرة واحدة وبيتوقف الإرسال اليومي ليه.
+// (ممكن تعدّلي نص الرسالة هنا زي ما تحبي)
+const FINAL_PAGE = 49;
+const CLOSING_MESSAGE =
+  '🌿 <b>ما شاء الله، خلصت رحلتنا مع سورة البقرة!</b>\n\n' +
+  'أتممت كل صفحات السورة بالتفسير والخرائط الذهنية والمراجعات، وده فضل كبير من الله.\n' +
+  'نسأل الله أن يجعلها حجة لك، وأن يبارك لك في حفظك ويثبّته في قلبك.\n\n' +
+  'المراجعة المستمرة هي سر الثبات، فارجع للصفحات وقت ما تحب. ' +
+  'ولو عايز تفتح الرسالة المثبتة تاني اكتب /menu 🤍';
+
 function shuffle(array) {
   const arr = [...array];
   for (let i = arr.length - 1; i > 0; i--) {
@@ -245,6 +256,12 @@ async function processUser(user, todayStr) {
   const isNewPageDay = day === 1 || day === 3 || day === 5;
 
   if (isNewPageDay) {
+    // خلّص كل الصفحات: رسالة الختام مرة واحدة، وبعدها نوقف الإرسال اليومي ليه
+    if (user.currentPage > FINAL_PAGE) {
+      await telegram.sendMessage(user.chatId, CLOSING_MESSAGE);
+      await sheets.setSubscribed(user.telegramId, false);
+      return true;
+    }
     const sent = await sendNewPageDay(user);
     if (!sent) return false; // خلصت الصفحات، متتحركش
     // يوم 1 هو أول يوم في البلوك، نسجل بداية البلوك هنا
