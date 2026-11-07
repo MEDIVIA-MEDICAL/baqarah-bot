@@ -128,7 +128,7 @@ async function handleReviewAnswer(telegramId, chatId, chosen, callbackQueryId) {
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
   // لو السؤال ليه تعليق في الشيت نعرضه قبل السؤال اللي بعده
-  if (quiz.explanation) await telegram.sendAnswerFeedback(chatId, quiz, correct);
+  await telegram.sendAnswerFeedback(chatId, quiz, correct);
   await advanceReview(telegramId, chatId, correct ? 1 : 0);
 }
 
@@ -150,7 +150,7 @@ async function handleMilestoneAnswer(telegramId, chatId, chosen, callbackQueryId
 
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
-  if (quiz.explanation) await telegram.sendAnswerFeedback(chatId, quiz, correct);
+  await telegram.sendAnswerFeedback(chatId, quiz, correct);
 
   const newScore = user.milestoneScore + (correct ? 1 : 0);
   const newIndex = user.milestoneQuestionIndex + 1;
