@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "google-spreadsheet": "^4.1.4",
-    "google-auth-library": "^9.15.0"
+    "google-auth-library": "^9.15.0",
+    "@vercel/functions": "^2.0.0"
   }
 }
