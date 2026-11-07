@@ -52,7 +52,7 @@ function shuffle(array) {
 }
 
 async function sendQuickCheckDay(user) {
-  // كل أسئلة الصفحة بالترتيب اللي في الشيت (مش أول سؤال بس)
+  // بنبعت أول سؤال في الصفحة بس. كل ما المستخدم يجاوب، البوت بيبعتله السؤال اللي بعده.
   const quizzes = await sheets.getQuizRowsForPage(user.currentPage);
   if (quizzes.length === 0) {
     await telegram.sendMessage(
@@ -61,14 +61,7 @@ async function sendQuickCheckDay(user) {
     );
     return;
   }
-  for (let occ = 0; occ < quizzes.length; occ++) {
-    const quiz = quizzes[occ];
-    if (quiz.type === 'complete') {
-      await telegram.sendSelfCheck(user.chatId, quiz, `quickdone:${user.currentPage}:${occ}`);
-    } else {
-      await telegram.sendQuickCheck(user.chatId, quiz, user.currentPage, occ);
-    }
-  }
+  await telegram.sendQuickCheckQuestion(user.chatId, quizzes[0], user.currentPage, 0);
 }
 
 // بيبدأ يوم المراجعة: بيجمع كل أسئلة الصفحات التلاتة، يخلطها، ويبعت أول سؤال

@@ -6,8 +6,16 @@ const sheets = require('../lib/sheets');
 const telegram = require('../lib/telegram');
 const { deliverFirstPage } = require('../lib/daily');
 
+// بيبعت سؤال التثبيت اللي بعد اللي اتجاوب (لو فيه). سؤال ورا سؤال بدل ما كلهم يتبعتوا مع بعض.
+async function sendNextQuickQuestion(chatId, pageNumber, nextOccurrence) {
+  const quizzes = await sheets.getQuizRowsForPage(pageNumber);
+  if (nextOccurrence < quizzes.length) {
+    await telegram.sendQuickCheckQuestion(chatId, quizzes[nextOccurrence], pageNumber, nextOccurrence);
+  }
+}
+
 // إجابة سؤال تثبيت من نوع اختيارات (يوم 2/4/6)
-async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryId, occurrence = 0) {
+async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryId, occurrence = 0, messageId) {
   const quiz = await sheets.getQuizByPageOccurrence(pageNumber, occurrence);
   if (!quiz) return;
   const correct = chosen === quiz.correct;
@@ -15,13 +23,17 @@ async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryI
     callbackQueryId,
     correct ? '✅ إجابة صحيحة!' : '❌ إجابة غير صحيحة'
   );
+  await telegram.clearKeyboard(chatId, messageId);
   await telegram.sendAnswerFeedback(chatId, quiz, correct, '🎉 ممتاز! إجابة صحيحة');
+  await sendNextQuickQuestion(chatId, pageNumber, occurrence + 1);
 }
 
 // تأكيد "سمّعتها" لسؤال إكمال الآية في يوم التثبيت - مفيهوش تصحيح، مجرد تشجيع
-async function handleQuickCheckDone(chatId, callbackQueryId) {
+async function handleQuickCheckDone(chatId, callbackQueryId, pageNumber, occurrence = 0, messageId) {
   await telegram.answerCallbackQuery(callbackQueryId, '🌿 تمام');
+  await telegram.clearKeyboard(chatId, messageId);
   await telegram.sendMessage(chatId, 'ما شاء الله عليك، استمر في الحفظ 🌿');
+  if (pageNumber) await sendNextQuickQuestion(chatId, pageNumber, occurrence + 1);
 }
 
 // بيتقدّم لسؤال المراجعة الجاي، أو يقفل المراجعة ويقرر يكمل ولا يعيد لو ده آخر سؤال.
@@ -224,8 +236,39 @@ function isOwner(telegramId) {
   return ids.includes(String(telegramId));
 }
 
+// بيبعت سؤال معاينة واحد. pageKey زي "5" لأسئلة صفحة، أو "m21" لأسئلة محطة.
+async function sendPreviewQuestion(chatId, pageKey, occ, quizzes) {
+  const isMilestone = /^m/i.test(pageKey);
+  const page = pageKey.replace(/^m/i, '');
+  const quiz = quizzes[occ];
+  const title = `🧪 <b>معاينة سؤال ${occ + 1}/${quizzes.length} (${isMilestone ? 'محطة ' : 'صفحة '}${page}):</b>`;
+
+  if (quiz.type === 'complete') {
+    await telegram.sendMessage(chatId, `${title}\n🎙️ ${quiz.question}`, {
+      reply_markup: {
+        inline_keyboard: [[{ text: '✅ سمّعتها', callback_data: `qprevdone:${pageKey}:${occ}` }]],
+      },
+    });
+    return;
+  }
+  const buttons = Object.entries(quiz.options)
+    .filter(([, text]) => text)
+    .map(([key, text]) => [
+      { text: `${key}) ${text}`, callback_data: `qprev:${pageKey}:${occ}:${key}` },
+    ]);
+  await telegram.sendMessage(chatId, `${title}\n${quiz.question}`, {
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+async function getPreviewQuizzes(pageKey) {
+  const isMilestone = /^m/i.test(pageKey);
+  const page = pageKey.replace(/^m/i, '');
+  return isMilestone ? sheets.getMilestoneQuizRows(page) : sheets.getQuizRowsForPage(page);
+}
+
 // /preview 5  -> يبعتلك محتوى صفحة 5 كاملًا زي ما بيوصل للمستخدمين
-// /quiz 5     -> يبعتلك كل أسئلة صفحة 5 بأزرارها (جرّبي تجاوبي وشوفي الرد)
+// /quiz 5     -> يبعتلك أسئلة صفحة 5 سؤال ورا سؤال (كل ما تجاوبي يظهر اللي بعده)
 // /quiz m21   -> نفس الحاجة لأسئلة اختبار محطة صفحة 21
 async function handleOwnerPreview(cmd, arg, chatId) {
   if (!arg) {
@@ -247,60 +290,48 @@ async function handleOwnerPreview(cmd, arg, chatId) {
   }
 
   // /quiz
-  const isMilestone = /^m/i.test(arg);
-  const page = arg.replace(/^m/i, '');
-  const quizzes = isMilestone
-    ? await sheets.getMilestoneQuizRows(page)
-    : await sheets.getQuizRowsForPage(page);
-
+  const quizzes = await getPreviewQuizzes(arg);
   if (quizzes.length === 0) {
-    await telegram.sendMessage(chatId, `مفيش أسئلة جاهزة ${isMilestone ? 'للمحطة' : 'لصفحة'} ${page}.`);
+    const label = /^m/i.test(arg) ? 'للمحطة' : 'لصفحة';
+    await telegram.sendMessage(chatId, `مفيش أسئلة جاهزة ${label} ${arg.replace(/^m/i, '')}.`);
     return;
   }
-
-  const prefix = isMilestone ? 'm' : '';
-  for (let occ = 0; occ < quizzes.length; occ++) {
-    const quiz = quizzes[occ];
-    const title = `🧪 <b>معاينة سؤال ${occ + 1}/${quizzes.length} (${isMilestone ? 'محطة ' : 'صفحة '}${page}):</b>`;
-    if (quiz.type === 'complete') {
-      await telegram.sendMessage(chatId, `${title}\n🎙️ ${quiz.question}`, {
-        reply_markup: {
-          inline_keyboard: [[{ text: '✅ سمّعتها', callback_data: `quickdone:${page}:0` }]],
-        },
-      });
-      continue;
-    }
-    const buttons = Object.entries(quiz.options)
-      .filter(([, text]) => text)
-      .map(([key, text]) => [
-        { text: `${key}) ${text}`, callback_data: `qprev:${prefix}${page}:${occ}:${key}` },
-      ]);
-    await telegram.sendMessage(chatId, `${title}\n${quiz.question}`, {
-      reply_markup: { inline_keyboard: buttons },
-    });
-  }
+  await sendPreviewQuestion(chatId, arg, 0, quizzes);
 }
 
-// إجابة سؤال معاينة: بتقيّم وتعرض نفس رد المستخدمين، من غير ما تغيّر أي تقدم
-async function handleQuizPreviewAnswer(telegramId, chatId, parts, callbackQueryId) {
+// إجابة سؤال معاينة: بتقيّم وتعرض نفس رد المستخدمين وبعدها السؤال اللي بعده، من غير ما تغيّر أي تقدم
+async function handleQuizPreviewAnswer(telegramId, chatId, parts, callbackQueryId, messageId) {
   if (!isOwner(telegramId)) {
     await telegram.answerCallbackQuery(callbackQueryId, '🌿');
     return;
   }
-  const [, pageRaw, occRaw, chosen] = parts;
-  const isMilestone = /^m/i.test(pageRaw);
-  const page = pageRaw.replace(/^m/i, '');
+  const [, pageKey, occRaw, chosen] = parts;
   const occ = parseInt(occRaw, 10);
-  const quiz = isMilestone
-    ? await sheets.getMilestoneQuizByOccurrence(page, occ)
-    : await sheets.getQuizByPageOccurrence(page, occ);
+  const quizzes = await getPreviewQuizzes(pageKey);
+  const quiz = quizzes[occ];
   if (!quiz) {
     await telegram.answerCallbackQuery(callbackQueryId, 'السؤال مش موجود، جرّبي /quiz تاني');
     return;
   }
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
+  await telegram.clearKeyboard(chatId, messageId);
   await telegram.sendAnswerFeedback(chatId, quiz, correct);
+  if (occ + 1 < quizzes.length) await sendPreviewQuestion(chatId, pageKey, occ + 1, quizzes);
+}
+
+// زرار "سمّعتها" في المعاينة: يكمّل للسؤال اللي بعده
+async function handleQuizPreviewDone(telegramId, chatId, parts, callbackQueryId, messageId) {
+  if (!isOwner(telegramId)) {
+    await telegram.answerCallbackQuery(callbackQueryId, '🌿');
+    return;
+  }
+  const [, pageKey, occRaw] = parts;
+  const occ = parseInt(occRaw, 10);
+  await telegram.answerCallbackQuery(callbackQueryId, '🌿 تمام');
+  await telegram.clearKeyboard(chatId, messageId);
+  const quizzes = await getPreviewQuizzes(pageKey);
+  if (occ + 1 < quizzes.length) await sendPreviewQuestion(chatId, pageKey, occ + 1, quizzes);
 }
 
 module.exports = async (req, res) => {
@@ -318,15 +349,17 @@ module.exports = async (req, res) => {
       const telegramId = cq.from.id;
       const parts = (cq.data || '').split(':');
       const type = parts[0];
+      const messageId = cq.message.message_id;
 
       if (type === 'quick') {
         // الصيغة الجديدة quick:الصفحة:ترتيب_السؤال:الاختيار (والقديمة quick:الصفحة:الاختيار لسه شغالة)
         const pageNumber = parts[1];
         const occurrence = parts.length >= 4 ? parseInt(parts[2], 10) || 0 : 0;
         const chosen = parts.length >= 4 ? parts[3] : parts[2];
-        await handleQuickCheckAnswer(chatId, pageNumber, chosen, cq.id, occurrence);
+        await handleQuickCheckAnswer(chatId, pageNumber, chosen, cq.id, occurrence, messageId);
       } else if (type === 'quickdone') {
-        await handleQuickCheckDone(chatId, cq.id);
+        const occurrence = parseInt(parts[2], 10) || 0;
+        await handleQuickCheckDone(chatId, cq.id, parts[1], occurrence, messageId);
       } else if (type === 'review') {
         const [, chosen] = parts;
         await handleReviewAnswer(telegramId, chatId, chosen, cq.id);
@@ -339,7 +372,9 @@ module.exports = async (req, res) => {
         const [, chosen] = parts;
         await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id);
       } else if (type === 'qprev') {
-        await handleQuizPreviewAnswer(telegramId, chatId, parts, cq.id);
+        await handleQuizPreviewAnswer(telegramId, chatId, parts, cq.id, messageId);
+      } else if (type === 'qprevdone') {
+        await handleQuizPreviewDone(telegramId, chatId, parts, cq.id, messageId);
       } else if (type === 'info') {
         const [, sectionIndex] = parts;
         await handleInfoSection(telegramId, chatId, parseInt(sectionIndex, 10), cq.id);
