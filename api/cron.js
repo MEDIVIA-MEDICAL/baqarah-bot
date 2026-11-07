@@ -207,6 +207,26 @@ async function nudgeReviewQuestion(user) {
   }
 }
 
+// ---------- تنبيهات ليكي على تيليجرام لو فيه مشكلة في الكرون ----------
+// بتتبعت لرقم/أرقام OWNER_TELEGRAM_ID. لو التنبيه نفسه فشل، الكرون مش بيتأثر.
+function escapeHtml(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function notifyOwner(text) {
+  const ids = String(process.env.OWNER_TELEGRAM_ID || '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+  for (const id of ids) {
+    try {
+      await telegram.sendMessage(id, text);
+    } catch (err) {
+      console.error('notifyOwner failed:', err.message);
+    }
+  }
+}
+
 // بيعالج مستخدم واحد. بيرجع true لو اتعدّ كمرسَل (نفس منطق الكرون القديم بالظبط).
 async function processUser(user, todayStr) {
   // المستخدم لسه وسط كويز مراجعة مجاوبوش خالص
@@ -306,9 +326,14 @@ async function triggerNextBatch(req, nextDepth) {
       headers,
       signal: controller.signal,
     });
-    if (!r.ok) console.error(`Next cron batch was rejected: HTTP ${r.status} from ${host}`);
+    if (!r.ok) {
+      console.error(`Next cron batch was rejected: HTTP ${r.status} from ${host}`);
+      return { ok: false, reason: `HTTP ${r.status}` };
+    }
+    return { ok: true };
   } catch (err) {
     console.error('Failed to trigger next cron batch:', err.message);
+    return { ok: false, reason: err.message };
   } finally {
     clearTimeout(timer);
   }
@@ -325,7 +350,9 @@ async function runBatch(req, depth) {
 
   let sentCount = 0;
   let failedCount = 0;
+  let skippedCount = 0; // مستخدمين واقفين لأن محتوى صفحتهم لسه مش مضاف في الشيت
   let nextIndex = 0;
+  const failures = [];
 
   async function worker() {
     while (Date.now() - startedAt < TIME_BUDGET_MS) {
@@ -334,9 +361,11 @@ async function runBatch(req, depth) {
       const user = pending[i];
       try {
         if (await processUser(user, todayStr)) sentCount += 1;
+        else skippedCount += 1;
       } catch (err) {
         // مستخدم واحد فشل متوقفش الباقي؛ هيتحاول تاني في الدفعة الجاية لأن lastSentDate متسجلش
         failedCount += 1;
+        failures.push(`${user.telegramId}: ${err && err.message ? err.message : err}`);
         console.error(`Cron error for user ${user.telegramId}:`, err);
       }
     }
@@ -346,12 +375,40 @@ async function runBatch(req, depth) {
 
   const remaining = Math.max(0, pending.length - nextIndex);
   let chained = false;
-  if (remaining > 0 && depth < MAX_CHAIN_DEPTH) {
-    chained = true;
-    await triggerNextBatch(req, depth + 1);
+  const problems = [];
+
+  if (failedCount > 0) {
+    const sample = failures.slice(0, 3).map(escapeHtml).join('\n');
+    problems.push(`❌ ${failedCount} مستخدم فشل الإرسال ليهم (هيتحاول تاني في الدفعة الجاية):\n${sample}`);
   }
 
-  return { ok: true, sent: sentCount, failed: failedCount, remaining, chained, depth, total: users.length };
+  if (remaining > 0 && depth < MAX_CHAIN_DEPTH) {
+    chained = true;
+    const next = await triggerNextBatch(req, depth + 1);
+    if (!next.ok) {
+      problems.push(
+        `⛔ الدفعة اللي بعدها متشغلتش (${escapeHtml(next.reason)}). فيه ${remaining} مستخدم لسه متبعتلهمش النهاردة.`
+      );
+    }
+  } else if (remaining > 0) {
+    problems.push(`⛔ وصلت لأقصى عدد دفعات وفيه ${remaining} مستخدم لسه متبعتلهمش النهاردة.`);
+  }
+
+  if (problems.length > 0) {
+    await notifyOwner(`⚠️ <b>تنبيه من بوت أخذها بركة (الكرون)</b>\n\n${problems.join('\n\n')}`);
+  }
+
+  // ملخص يومي: بيتبعت لما آخر دفعة تخلص بس. لو وصلتك الرسالة دي يبقى الكرون اشتغل.
+  // (محسوب من البيانات اللي اتقرت أصلًا، فمفيش قراءة زيادة من الشيت)
+  if (remaining === 0) {
+    const sentToday = users.length - pending.length + sentCount;
+    let summary = `✅ <b>الكرون خلص النهاردة</b>\n\n📨 اتبعت لـ ${sentToday} من ${users.length} مشترك نشط`;
+    if (skippedCount > 0) summary += `\n⏸️ ${skippedCount} واقفين لأن محتوى صفحتهم لسه مش مضاف`;
+    if (failedCount > 0) summary += `\n❌ ${failedCount} فشلوا (هيتحاولوا تاني)`;
+    await notifyOwner(summary);
+  }
+
+  return { ok: true, sent: sentCount, failed: failedCount, skipped: skippedCount, remaining, chained, depth, total: users.length };
 }
 
 module.exports = async (req, res) => {
@@ -370,7 +427,10 @@ module.exports = async (req, res) => {
     waitUntil(
       runBatch(req, depth)
         .then((result) => console.log('Cron batch done:', JSON.stringify(result)))
-        .catch((err) => console.error('Cron batch error:', err))
+        .catch(async (err) => {
+          console.error('Cron batch error:', err);
+          await notifyOwner(`⚠️ <b>تنبيه من بوت أخذها بركة (الكرون)</b>\n\nالكرون وقف بخطأ: ${escapeHtml(err && err.message ? err.message : err)}`);
+        })
     );
     return;
   }
@@ -381,6 +441,7 @@ module.exports = async (req, res) => {
     return res.status(200).json(result);
   } catch (err) {
     console.error('Cron error:', err);
+    await notifyOwner(`⚠️ <b>تنبيه من بوت أخذها بركة (الكرون)</b>\n\nالكرون وقف بخطأ: ${escapeHtml(err && err.message ? err.message : err)}`);
     return res.status(500).json({ ok: false, error: String(err) });
   }
 };

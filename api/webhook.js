@@ -267,6 +267,31 @@ async function getPreviewQuizzes(pageKey) {
   return isMilestone ? sheets.getMilestoneQuizRows(page) : sheets.getQuizRowsForPage(page);
 }
 
+// /stats -> إحصائيات سريعة عن المستخدمين (ليكي إنتي بس). قراءة بس، مفيش أي كتابة.
+const FINAL_PAGE = 49; // لازم تفضل زي FINAL_PAGE في api/cron.js
+
+async function handleOwnerStats(chatId) {
+  const users = await sheets.getAllUsers();
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  const finished = users.filter((u) => u.currentPage > FINAL_PAGE).length;
+  const active = users.filter((u) => u.subscribed && u.currentPage <= FINAL_PAGE);
+  const sentToday = active.filter((u) => u.lastSentDate === todayStr).length;
+  const waiting = active.length - sentToday;
+  const stopped = users.filter((u) => !u.subscribed && u.currentPage <= FINAL_PAGE).length;
+
+  await telegram.sendMessage(
+    chatId,
+    `📊 <b>إحصائيات البوت</b>\n\n` +
+      `👥 إجمالي المسجلين: ${users.length}\n` +
+      `🟢 مشتركين نشطين: ${active.length}\n` +
+      `   ✉️ استلموا النهاردة: ${sentToday}\n` +
+      `   ⏳ لسه متبعتلهمش النهاردة: ${waiting}\n` +
+      `🏁 خلّصوا السورة: ${finished}\n` +
+      `⏸️ موقّفين الإرسال: ${stopped}`
+  );
+}
+
 // /preview 5  -> يبعتلك محتوى صفحة 5 كاملًا زي ما بيوصل للمستخدمين
 // /quiz 5     -> يبعتلك أسئلة صفحة 5 سؤال ورا سؤال (كل ما تجاوبي يظهر اللي بعده)
 // /quiz m21   -> نفس الحاجة لأسئلة اختبار محطة صفحة 21
@@ -396,6 +421,10 @@ module.exports = async (req, res) => {
     // أوامر المعاينة: شغالة لحسابك إنتي بس، وأي حد تاني بيكمل عادي في الردود اللي تحت
     const [rawCmd, cmdArg] = text.split(/\s+/);
     const cmd = rawCmd.split('@')[0].toLowerCase();
+    if (cmd === '/stats' && isOwner(telegramId)) {
+      await handleOwnerStats(chatId);
+      return res.status(200).send('OK');
+    }
     if ((cmd === '/preview' || cmd === '/quiz') && isOwner(telegramId)) {
       await handleOwnerPreview(cmd, cmdArg, chatId);
       return res.status(200).send('OK');
