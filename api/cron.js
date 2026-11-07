@@ -26,8 +26,8 @@ try {
   waitUntil = null;
 }
 
-// إعدادات الدفعات: كل دفعة بتشتغل لحد 45 ثانية (من 60 المسموحة)، وبعدها بتنده الدفعة اللي بعدها.
-const TIME_BUDGET_MS = 45 * 1000;
+// إعدادات الدفعات: كل دفعة بتشتغل لحد 40 ثانية (من 60 المسموحة، والباقي هامش أمان)، وبعدها بتنده الدفعة اللي بعدها.
+const TIME_BUDGET_MS = 40 * 1000;
 const CONCURRENCY = 3; // عدد المستخدمين اللي بيتعالجوا مع بعض (قليل عشان حدود جوجل وتيليجرام)
 const MAX_CHAIN_DEPTH = 40; // حماية من أي تسلسل لا نهائي
 
@@ -292,18 +292,21 @@ async function processUser(user, todayStr) {
 
 // بينده الدفعة اللي بعدها على نفس الرابط. الدفعة الجاية بترد فورًا (202) وتكمّل في الخلفية.
 async function triggerNextBatch(req, nextDepth) {
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
-  const proto = req.headers['x-forwarded-proto'] || 'https';
+  // بنفضّل رابط الإنتاج الرسمي (بيكون مفتوح)، لأن رابط الـ deployment الفرعي ممكن يكون محمي من Vercel
+  const host =
+    process.env.VERCEL_PROJECT_PRODUCTION_URL || req.headers['x-forwarded-host'] || req.headers.host;
+  const proto = process.env.VERCEL_PROJECT_PRODUCTION_URL ? 'https' : req.headers['x-forwarded-proto'] || 'https';
   const headers = {};
   if (process.env.CRON_SECRET) headers['authorization'] = `Bearer ${process.env.CRON_SECRET}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10 * 1000);
   try {
-    await fetch(`${proto}://${host}/api/cron?chain=1&depth=${nextDepth}`, {
+    const r = await fetch(`${proto}://${host}/api/cron?chain=1&depth=${nextDepth}`, {
       headers,
       signal: controller.signal,
     });
+    if (!r.ok) console.error(`Next cron batch was rejected: HTTP ${r.status} from ${host}`);
   } catch (err) {
     console.error('Failed to trigger next cron batch:', err.message);
   } finally {
