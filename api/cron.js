@@ -17,6 +17,20 @@ const sheets = require('../lib/sheets');
 const telegram = require('../lib/telegram');
 const { sendNewPageDay, progressAfterNewPage } = require('../lib/daily');
 
+// waitUntil بتخلي Vercel يكمّل شغل الدفعة في الخلفية بعد ما الرد يترجّع (مكتبة @vercel/functions).
+// لو المكتبة مش متثبتة لأي سبب، الكرون يشتغل عادي من غير تسلسل الدفعات.
+let waitUntil = null;
+try {
+  ({ waitUntil } = require('@vercel/functions'));
+} catch (err) {
+  waitUntil = null;
+}
+
+// إعدادات الدفعات: كل دفعة بتشتغل لحد 45 ثانية (من 60 المسموحة)، وبعدها بتنده الدفعة اللي بعدها.
+const TIME_BUDGET_MS = 45 * 1000;
+const CONCURRENCY = 3; // عدد المستخدمين اللي بيتعالجوا مع بعض (قليل عشان حدود جوجل وتيليجرام)
+const MAX_CHAIN_DEPTH = 40; // حماية من أي تسلسل لا نهائي
+
 function shuffle(array) {
   const arr = [...array];
   for (let i = arr.length - 1; i > 0; i--) {
@@ -27,7 +41,7 @@ function shuffle(array) {
 }
 
 async function sendQuickCheckDay(user) {
-  const quiz = await sheets.getQuizRawsForPage(user.currentPage);
+  const quiz = await sheets.getFirstQuizForPage(user.currentPage);
   if (!quiz) {
     await telegram.sendMessage(
       user.chatId,
@@ -185,103 +199,169 @@ async function nudgeReviewQuestion(user) {
   }
 }
 
+// بيعالج مستخدم واحد. بيرجع true لو اتعدّ كمرسَل (نفس منطق الكرون القديم بالظبط).
+async function processUser(user, todayStr) {
+  // المستخدم لسه وسط كويز مراجعة مجاوبوش خالص
+  if (user.reviewQueue.length > 0 && user.reviewQuestionIndex < user.reviewQueue.length) {
+    await nudgeReviewQuestion(user);
+    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    return true;
+  }
+
+  // المستخدم لسه وسط اختبار محطة مجاوبوش خالص
+  if (user.milestoneQueue.length > 0 && user.milestoneQuestionIndex < user.milestoneQueue.length) {
+    await nudgeMilestoneQuestion(user);
+    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    return true;
+  }
+
+  // المستخدم لسه مقررش يعيد ولا يكمل بعد نتيجة مراجعة ضعيفة
+  if (user.pendingChoice === 'low_score') {
+    await telegram.sendRepeatChoiceReminder(user.chatId);
+    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    return true;
+  }
+
+  const day = user.cycleDay;
+
+  if (day === 9) {
+    await startMilestoneDay(user);
+    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    return true;
+  }
+
+  if (day === 8) {
+    await sendCombinedRepeatDay(user);
+    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    return true;
+  }
+
+  if (day === 7) {
+    await startReviewDay(user);
+    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    return true;
+  }
+
+  const isNewPageDay = day === 1 || day === 3 || day === 5;
+
+  if (isNewPageDay) {
+    const sent = await sendNewPageDay(user);
+    if (!sent) return false; // خلصت الصفحات، متتحركش
+    // يوم 1 هو أول يوم في البلوك، نسجل بداية البلوك هنا
+    const updates = { ...progressAfterNewPage(user, day), lastSentDate: todayStr };
+    await sheets.updateUserFields(user.telegramId, updates);
+    return true;
+  }
+
+  // يوم تثبيت (2 أو 4 أو 6)
+  await sendQuickCheckDay(user);
+  const checkedPage = user.currentPage;
+  const updates = { lastSentDate: todayStr };
+
+  // لو الصفحة دي صفحة محطة (زي 21/41/49)، ندخل يوم اختبار إضافي قبل ما نكمل عادي
+  const milestoneQuizzes = await sheets.getMilestoneQuizRows(checkedPage);
+  if (milestoneQuizzes.length > 0) {
+    updates.cycleDay = 9;
+    updates.milestonePage = checkedPage;
+    updates.pendingResumeDay = day + 1;
+  } else {
+    updates.cycleDay = day + 1;
+  }
+
+  // بعد يوم التثبيت (غير آخر واحد يوم 6) بنتحرك للصفحة الجاية
+  if (day === 2 || day === 4) {
+    updates.currentPage = user.currentPage + 1;
+  }
+  await sheets.updateUserFields(user.telegramId, updates);
+  return true;
+}
+
+// بينده الدفعة اللي بعدها على نفس الرابط. الدفعة الجاية بترد فورًا (202) وتكمّل في الخلفية.
+async function triggerNextBatch(req, nextDepth) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  const headers = {};
+  if (process.env.CRON_SECRET) headers['authorization'] = `Bearer ${process.env.CRON_SECRET}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10 * 1000);
+  try {
+    await fetch(`${proto}://${host}/api/cron?chain=1&depth=${nextDepth}`, {
+      headers,
+      signal: controller.signal,
+    });
+  } catch (err) {
+    console.error('Failed to trigger next cron batch:', err.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// دفعة واحدة: بتعالج المستخدمين اللي لسه متبعتلهمش النهاردة لحد ما الوقت المحدد يخلص.
+// لو لسه فيه ناس، بتنده الدفعة اللي بعدها. (lastSentDate بيمنع أي تكرار)
+async function runBatch(req, depth) {
+  const startedAt = Date.now();
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  const users = await sheets.getAllSubscribedUsers();
+  const pending = users.filter((u) => u.lastSentDate !== todayStr);
+
+  let sentCount = 0;
+  let failedCount = 0;
+  let nextIndex = 0;
+
+  async function worker() {
+    while (Date.now() - startedAt < TIME_BUDGET_MS) {
+      const i = nextIndex++;
+      if (i >= pending.length) return;
+      const user = pending[i];
+      try {
+        if (await processUser(user, todayStr)) sentCount += 1;
+      } catch (err) {
+        // مستخدم واحد فشل متوقفش الباقي؛ هيتحاول تاني في الدفعة الجاية لأن lastSentDate متسجلش
+        failedCount += 1;
+        console.error(`Cron error for user ${user.telegramId}:`, err);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+  const remaining = Math.max(0, pending.length - nextIndex);
+  let chained = false;
+  if (remaining > 0 && depth < MAX_CHAIN_DEPTH) {
+    chained = true;
+    await triggerNextBatch(req, depth + 1);
+  }
+
+  return { ok: true, sent: sentCount, failed: failedCount, remaining, chained, depth, total: users.length };
+}
+
 module.exports = async (req, res) => {
   const authHeader = req.headers['authorization'];
   if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).send('Unauthorized');
   }
 
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const query = req.query || {};
+  const depth = parseInt(query.depth || '0', 10) || 0;
+  const isChained = query.chain === '1';
+
+  // دفعة متسلسلة: نرد فورًا ونكمل الشغل في الخلفية (عشان الدفعة اللي قبلها متستناش)
+  if (isChained && waitUntil) {
+    res.status(202).json({ accepted: true, depth });
+    waitUntil(
+      runBatch(req, depth)
+        .then((result) => console.log('Cron batch done:', JSON.stringify(result)))
+        .catch((err) => console.error('Cron batch error:', err))
+    );
+    return;
+  }
 
   try {
-    const users = await sheets.getAllSubscribedUsers();
-    let sentCount = 0;
-
-    for (const user of users) {
-      if (user.lastSentDate === todayStr) continue;
-
-      // المستخدم لسه وسط كويز مراجعة مجاوبوش خالص
-      if (user.reviewQueue.length > 0 && user.reviewQuestionIndex < user.reviewQueue.length) {
-        await nudgeReviewQuestion(user);
-        await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
-        sentCount += 1;
-        continue;
-      }
-
-      // المستخدم لسه وسط اختبار محطة مجاوبوش خالص
-      if (user.milestoneQueue.length > 0 && user.milestoneQuestionIndex < user.milestoneQueue.length) {
-        await nudgeMilestoneQuestion(user);
-        await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
-        sentCount += 1;
-        continue;
-      }
-
-      // المستخدم لسه مقررش يعيد ولا يكمل بعد نتيجة مراجعة ضعيفة
-      if (user.pendingChoice === 'low_score') {
-        await telegram.sendRepeatChoiceReminder(user.chatId);
-        await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
-        sentCount += 1;
-        continue;
-      }
-
-      const day = user.cycleDay;
-
-      if (day === 9) {
-        await startMilestoneDay(user);
-        await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
-        sentCount += 1;
-        continue;
-      }
-
-      if (day === 8) {
-        await sendCombinedRepeatDay(user);
-        await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
-        sentCount += 1;
-        continue;
-      }
-
-      if (day === 7) {
-        await startReviewDay(user);
-        await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
-        sentCount += 1;
-        continue;
-      }
-
-      const isNewPageDay = day === 1 || day === 3 || day === 5;
-
-      if (isNewPageDay) {
-        const sent = await sendNewPageDay(user);
-        if (!sent) continue; // خلصت الصفحات، متتحركش
-        // يوم 1 هو أول يوم في البلوك، نسجل بداية البلوك هنا
-        const updates = { ...progressAfterNewPage(user, day), lastSentDate: todayStr };
-        await sheets.updateUserFields(user.telegramId, updates);
-      } else {
-        // يوم تثبيت (2 أو 4 أو 6)
-        await sendQuickCheckDay(user);
-        const checkedPage = user.currentPage;
-        const updates = { lastSentDate: todayStr };
-
-        // لو الصفحة دي صفحة محطة (زي 21/41/49)، ندخل يوم اختبار إضافي قبل ما نكمل عادي
-        const milestoneQuizzes = await sheets.getMilestoneQuizRows(checkedPage);
-        if (milestoneQuizzes.length > 0) {
-          updates.cycleDay = 9;
-          updates.milestonePage = checkedPage;
-          updates.pendingResumeDay = day + 1;
-        } else {
-          updates.cycleDay = day + 1;
-        }
-
-        // بعد يوم التثبيت (غير آخر واحد يوم 6) بنتحرك للصفحة الجاية
-        if (day === 2 || day === 4) {
-          updates.currentPage = user.currentPage + 1;
-        }
-        await sheets.updateUserFields(user.telegramId, updates);
-      }
-
-      sentCount += 1;
-    }
-
-    return res.status(200).json({ ok: true, sent: sentCount, total: users.length });
+    const result = await runBatch(req, depth);
+    console.log('Cron batch done:', JSON.stringify(result));
+    return res.status(200).json(result);
   } catch (err) {
     console.error('Cron error:', err);
     return res.status(500).json({ ok: false, error: String(err) });
