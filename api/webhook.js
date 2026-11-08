@@ -6,6 +6,34 @@ const sheets = require('../lib/sheets');
 const telegram = require('../lib/telegram');
 const { deliverFirstPage } = require('../lib/daily');
 
+// ---------- حد التسجيل ----------
+// أول MAX_FREE_USERS مستخدم بيدخلوا عادي. بعد كده الدخول بكود من تاب Invites في الشيت.
+// ممكن تغيّري الرقم من Vercel (متغير MAX_FREE_USERS) من غير ما تلمسي الكود.
+const MAX_FREE_USERS = parseInt(process.env.MAX_FREE_USERS || '300', 10);
+
+// الرسالة اللي بتظهر لمن يحاول يسجل بعد اكتمال العدد (عدّلي طريقة التواصل زي ما تحبي)
+const ACCESS_FULL_TEXT =
+  '🌿 أهلًا بيك!\n\n' +
+  'البوت وصل دلوقتي للعدد الأقصى من المشتركين الجدد.\n' +
+  'لو معاك كود دخول ابعته هنا في رسالة، أو افتح الرابط اللي فيه الكود.\n' +
+  'ولو عايز تطلب كود، تواصل مع القائمين على البوت.';
+const ACCESS_INVALID_TEXT =
+  'لو كنت بتكتب كود دخول، فهو مش صحيح أو اتستخدم قبل كده 🌿\n' +
+  'ولو محتاج كود، تواصل مع القائمين على البوت.';
+
+// بتحدد المستخدم مسجل ولا لأ، والتسجيل الجديد مفتوح ولا العدد اكتمل (المالك دايمًا مسموح له)
+async function registrationStatus(telegramId) {
+  if (isOwner(telegramId)) return { registered: true, full: false };
+  let ids = await sheets.getRegisteredIds();
+  if (ids.has(String(telegramId))) return { registered: true, full: false };
+  // لو قرّبنا من الحد، نقرا الشيت بأحدث نسخة قبل ما نقرر (عشان ما نتعداش الحد)
+  if (ids.size >= MAX_FREE_USERS - 10) {
+    ids = await sheets.getRegisteredIds(true);
+    if (ids.has(String(telegramId))) return { registered: true, full: false };
+  }
+  return { registered: false, full: ids.size >= MAX_FREE_USERS };
+}
+
 // بيبعت سؤال التثبيت اللي بعد اللي اتجاوب (لو فيه). سؤال ورا سؤال بدل ما كلهم يتبعتوا مع بعض.
 async function sendNextQuickQuestion(chatId, pageNumber, nextOccurrence) {
   const quizzes = await sheets.getQuizRowsForPage(pageNumber);
@@ -283,7 +311,7 @@ async function handleOwnerStats(chatId) {
   await telegram.sendMessage(
     chatId,
     `📊 <b>إحصائيات البوت</b>\n\n` +
-      `👥 إجمالي المسجلين: ${users.length}\n` +
+      `👥 إجمالي المسجلين: ${users.length} (الحد: ${MAX_FREE_USERS})\n` +
       `🟢 مشتركين نشطين: ${active.length}\n` +
       `   ✉️ استلموا النهاردة: ${sentToday}\n` +
       `   ⏳ لسه متبعتلهمش النهاردة: ${waiting}\n` +
@@ -359,6 +387,73 @@ async function handleQuizPreviewDone(telegramId, chatId, parts, callbackQueryId,
   if (occ + 1 < quizzes.length) await sendPreviewQuestion(chatId, pageKey, occ + 1, quizzes);
 }
 
+// ---------- /today وزرار "ابعتلي صفحة اليوم": بيبعت آخر صفحة وصلت للمستخدم تاني ----------
+// آخر صفحة اتبعتت بتتحدد من يوم الدورة الحالي:
+//   2/4/6/7: آخر صفحة جديدة اتبعتت هي currentPage
+//   1/3/5:   currentPage لسه اتقدمت (بعد يوم تثبيت أو بلوك جديد) فاللي اتبعتت هو اللي قبلها
+//   9:       صفحة المحطة
+function lastSentContentPage(user) {
+  const d = user.cycleDay;
+  if (d === 9 && user.milestonePage) return user.milestonePage;
+  if (d === 1 || d === 3 || d === 5) return user.currentPage - 1;
+  return user.currentPage;
+}
+
+const todayCooldown = new Map(); // عشان ضغط الزرار ورا بعض ما يبعتش الصفحة كذا مرة
+const TODAY_COOLDOWN_MS = 15 * 1000;
+
+async function handleToday(telegramId, chatId) {
+  const now = Date.now();
+  if (now - (todayCooldown.get(String(telegramId)) || 0) < TODAY_COOLDOWN_MS) return;
+  todayCooldown.set(String(telegramId), now);
+
+  const user = await sheets.getUserProgress(telegramId);
+  if (!user) {
+    await telegram.sendMessage(chatId, 'اكتب /start عشان تبدأ رحلة حفظ سورة البقرة 🌿');
+    return;
+  }
+
+  // لسه ماستلمش ولا صفحة: نبعتله أول صفحة (نفس /start)
+  if (!user.lastSentDate && user.currentPage === 1 && user.cycleDay === 1) {
+    await deliverFirstPage(user, new Date().toISOString().slice(0, 10));
+    return;
+  }
+
+  const page = lastSentContentPage(user);
+  const content = page >= 1 ? await sheets.getContentForPage(page) : null;
+  if (!content) {
+    await telegram.sendMessage(chatId, 'مفيش صفحة جديدة اتبعتتلك لسه 🌿 هتوصلك في معادها إن شاء الله.');
+    return;
+  }
+  await telegram.sendDailyPage(chatId, content);
+}
+
+// تسجيل/ترحيب بمستخدم (جديد أو قديم) عند /start
+async function handleStart(telegramId, chatId, name) {
+  const user = await sheets.upsertUser({ telegramId, chatId, name, startPage: 1 });
+  sheets.noteRegistered(telegramId);
+  await telegram.sendMessage(
+    chatId,
+    `أهلًا بيك يا ${name} 🌿\n\n` +
+      'رحلتك في حفظ سورة البقرة هتكون كده:\n' +
+      '📖 يوم صفحة جديدة (فيديو + صوت + خريطة ذهنية + تفسير)\n' +
+      '🧩 يوم تثبيت عليها\n' +
+      'وكل 3 صفحات هيجيلك يوم مراجعة شاملة عليهم كلهم.\n\n' +
+      'لو الصفحة ماوصلتش أو عايز تشوفها تاني اضغط "ابعتلي صفحة اليوم" في الرسالة المثبتة أو اكتب /today.\n' +
+      'ولو حابب توقف الإرسال اليومي مؤقتًا اكتب /stop، ولو عايز ترجعه اكتب /resume.'
+  );
+  // مستخدم جديد: نبعت المثبت دايمًا (حتى لو تيليجرام لسه فاكر مثبت قديم بعد مسح الشات)
+  // مستخدم قديم عمل /start تاني: ما نبعتهوش لو عنده مثبت بالفعل
+  await showPinnedMenu(chatId, user.isNew);
+  // مستخدم جديد: أول صفحة تتبعت فورًا، وباقي الأيام الكرون يبعتها الساعة 7
+  // وكمان لو مستخدم مسجل بس لسه ماستلمش ولا صفحة (مثلًا /start الأولاني وقف في النص بخطأ)،
+  // فلما يكتب /start تاني نبعتله أول صفحة. (deliverFirstPage بتسجّل اليوم الأول، فمفيش تكرار)
+  const neverReceivedAnything = !user.lastSentDate && user.currentPage === 1 && user.cycleDay === 1;
+  if (user.isNew || neverReceivedAnything) {
+    await deliverFirstPage(user, new Date().toISOString().slice(0, 10));
+  }
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(200).send('OK - webhook is alive');
@@ -396,6 +491,9 @@ module.exports = async (req, res) => {
       } else if (type === 'milestone') {
         const [, chosen] = parts;
         await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id);
+      } else if (type === 'today') {
+        await telegram.answerCallbackQuery(cq.id, '📖');
+        await handleToday(telegramId, chatId);
       } else if (type === 'qprev') {
         await handleQuizPreviewAnswer(telegramId, chatId, parts, cq.id, messageId);
       } else if (type === 'qprevdone') {
@@ -430,24 +528,22 @@ module.exports = async (req, res) => {
       return res.status(200).send('OK');
     }
 
-    if (text === '/start') {
-      const user = await sheets.upsertUser({ telegramId, chatId, name, startPage: 1 });
-      await telegram.sendMessage(
-        chatId,
-        `أهلًا بيك يا ${name} 🌿\n\n` +
-          'رحلتك في حفظ سورة البقرة هتكون كده:\n' +
-          '📖 يوم صفحة جديدة (فيديو + صوت + خريطة ذهنية + تفسير)\n' +
-          '🧩 يوم تثبيت عليها\n' +
-          'وكل 3 صفحات هيجيلك يوم مراجعة شاملة عليهم كلهم.\n\n' +
-          'لو حابب توقف الإرسال اليومي مؤقتًا اكتب /stop، ولو عايز ترجعه اكتب /resume.'
-      );
-      // مستخدم جديد: نبعت المثبت دايمًا (حتى لو تيليجرام لسه فاكر مثبت قديم بعد مسح الشات)
-      // مستخدم قديم عمل /start تاني: ما نبعتهوش لو عنده مثبت بالفعل
-      await showPinnedMenu(chatId, user.isNew);
-      // مستخدم جديد: أول صفحة تتبعت فورًا، وباقي الأيام الكرون يبعتها الساعة 7
-      if (user.isNew) {
-        await deliverFirstPage(user, new Date().toISOString().slice(0, 10));
+    if (cmd === '/start') {
+      const { registered, full } = await registrationStatus(telegramId);
+      if (!registered && full) {
+        // العدد اكتمل: الدخول بكود بس (/start الكود، أو الكود في رسالة لوحده)
+        const ok = cmdArg ? await sheets.redeemInviteCode(cmdArg, telegramId) : false;
+        if (!ok) {
+          await telegram.sendMessage(chatId, cmdArg ? ACCESS_INVALID_TEXT : ACCESS_FULL_TEXT);
+          return res.status(200).send('OK');
+        }
       }
+      await handleStart(telegramId, chatId, name);
+      return res.status(200).send('OK');
+    }
+
+    if (cmd === '/today') {
+      await handleToday(telegramId, chatId);
       return res.status(200).send('OK');
     }
 
@@ -484,6 +580,17 @@ module.exports = async (req, res) => {
     }
 
     // أي رسالة تانية
+    // مستخدم مش مسجل والعدد اكتمل: لو كتب كود في رسالة، نجرّبه
+    const access = await registrationStatus(telegramId);
+    if (!access.registered && access.full) {
+      if (!text.startsWith('/') && (await sheets.redeemInviteCode(text, telegramId))) {
+        await handleStart(telegramId, chatId, name);
+        return res.status(200).send('OK');
+      }
+      await telegram.sendMessage(chatId, text.startsWith('/') ? ACCESS_FULL_TEXT : ACCESS_INVALID_TEXT);
+      return res.status(200).send('OK');
+    }
+
     await telegram.sendMessage(chatId, 'اكتب /start عشان تبدأ رحلة حفظ سورة البقرة 🌿');
     return res.status(200).send('OK');
   } catch (err) {
