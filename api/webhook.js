@@ -34,6 +34,16 @@ async function registrationStatus(telegramId) {
   return { registered: false, full: ids.size >= MAX_FREE_USERS };
 }
 
+function escapeHtmlLocal(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// نص بعد "سمّعتها": تشجيع، ومعاه التعليق لو موجود في الشيت
+function selfCheckDoneText(quiz) {
+  const base = 'ما شاء الله عليك، استمر في الحفظ 🌿';
+  return quiz && quiz.explanation ? `${base}\n\n💡 ${escapeHtmlLocal(quiz.explanation)}` : base;
+}
+
 // بيبعت سؤال التثبيت اللي بعد اللي اتجاوب (لو فيه). سؤال ورا سؤال بدل ما كلهم يتبعتوا مع بعض.
 async function sendNextQuickQuestion(chatId, pageNumber, nextOccurrence) {
   const quizzes = await sheets.getQuizRowsForPage(pageNumber);
@@ -51,7 +61,8 @@ async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryI
     callbackQueryId,
     correct ? '✅ إجابة صحيحة!' : '❌ إجابة غير صحيحة'
   );
-  await telegram.clearKeyboard(chatId, messageId);
+  // الاختيارات بتفضل ظاهرة في رسالة السؤال مع علامة الصح/الغلط
+  await telegram.finishQuestionMessage(chatId, messageId, telegram.QUICK_HEADER, quiz, chosen);
   await telegram.sendAnswerFeedback(chatId, quiz, correct, '🎉 ممتاز! إجابة صحيحة');
   await sendNextQuickQuestion(chatId, pageNumber, occurrence + 1);
 }
@@ -59,8 +70,11 @@ async function handleQuickCheckAnswer(chatId, pageNumber, chosen, callbackQueryI
 // تأكيد "سمّعتها" لسؤال إكمال الآية في يوم التثبيت - مفيهوش تصحيح، مجرد تشجيع
 async function handleQuickCheckDone(chatId, callbackQueryId, pageNumber, occurrence = 0, messageId) {
   await telegram.answerCallbackQuery(callbackQueryId, '🌿 تمام');
-  await telegram.clearKeyboard(chatId, messageId);
-  await telegram.sendMessage(chatId, 'ما شاء الله عليك، استمر في الحفظ 🌿');
+  const quiz = pageNumber ? await sheets.getQuizByPageOccurrence(pageNumber, occurrence) : null;
+  if (quiz) await telegram.finishQuestionMessage(chatId, messageId, '', quiz);
+  else await telegram.clearKeyboard(chatId, messageId);
+  // لو أنتِ كاتبة تعليق للسؤال ده في الشيت بيظهر مع التشجيع
+  await telegram.sendMessage(chatId, selfCheckDoneText(quiz));
   if (pageNumber) await sendNextQuickQuestion(chatId, pageNumber, occurrence + 1);
 }
 
@@ -155,7 +169,7 @@ async function handleReviewChoice(telegramId, chatId, choice, callbackQueryId) {
 }
 
 // إجابة سؤال اختيارات ضمن يوم المراجعة الكبير
-async function handleReviewAnswer(telegramId, chatId, chosen, callbackQueryId) {
+async function handleReviewAnswer(telegramId, chatId, chosen, callbackQueryId, messageId) {
   const user = await sheets.getUserProgress(telegramId);
   if (!user || user.reviewQueue.length === 0) return;
 
@@ -167,19 +181,33 @@ async function handleReviewAnswer(telegramId, chatId, chosen, callbackQueryId) {
 
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
+  const header = `🌟 <b>سؤال المراجعة (${user.reviewQuestionIndex + 1}/${user.reviewQueue.length}):</b>\n`;
+  await telegram.finishQuestionMessage(chatId, messageId, header, quiz, chosen);
   // لو السؤال ليه تعليق في الشيت نعرضه قبل السؤال اللي بعده
   await telegram.sendAnswerFeedback(chatId, quiz, correct);
   await advanceReview(telegramId, chatId, correct ? 1 : 0);
 }
 
 // تأكيد "سمّعتها" لسؤال إكمال الآية جوه يوم المراجعة الكبير
-async function handleReviewDone(telegramId, chatId, callbackQueryId) {
+async function handleReviewDone(telegramId, chatId, callbackQueryId, messageId) {
   await telegram.answerCallbackQuery(callbackQueryId, '🌿 تمام');
+  const user = await sheets.getUserProgress(telegramId);
+  if (!user || user.reviewQueue.length === 0) return;
+  const currentEntry = user.reviewQueue[user.reviewQuestionIndex];
+  if (!currentEntry) return;
+  const [page, occurrence] = currentEntry.split(':');
+  const quiz = await sheets.getQuizByPageOccurrence(page, parseInt(occurrence, 10));
+  const header = `🌟 <b>سؤال المراجعة (${user.reviewQuestionIndex + 1}/${user.reviewQueue.length}):</b>\n`;
+  if (quiz) await telegram.finishQuestionMessage(chatId, messageId, header, quiz);
+  // لو فيه تعليق للسؤال ده في الشيت نعرضه قبل ما نكمل
+  if (quiz && quiz.explanation) {
+    await telegram.sendMessage(chatId, `💡 ${escapeHtmlLocal(quiz.explanation)}`);
+  }
   await advanceReview(telegramId, chatId, 0);
 }
 
 // إجابة سؤال اختيارات ضمن اختبار محطة (صفحة 21/41/49 مثلاً) - مفيش إيقاف على النتيجة أبدًا
-async function handleMilestoneAnswer(telegramId, chatId, chosen, callbackQueryId) {
+async function handleMilestoneAnswer(telegramId, chatId, chosen, callbackQueryId, messageId) {
   const user = await sheets.getUserProgress(telegramId);
   if (!user || user.milestoneQueue.length === 0) return;
 
@@ -190,6 +218,8 @@ async function handleMilestoneAnswer(telegramId, chatId, chosen, callbackQueryId
 
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
+  const header = `🏁 <b>سؤال اختبار المحطة (${user.milestoneQuestionIndex + 1}/${user.milestoneQueue.length}):</b>\n`;
+  await telegram.finishQuestionMessage(chatId, messageId, header, quiz, chosen);
   await telegram.sendAnswerFeedback(chatId, quiz, correct);
 
   const newScore = user.milestoneScore + (correct ? 1 : 0);
@@ -264,12 +294,18 @@ function isOwner(telegramId) {
   return ids.includes(String(telegramId));
 }
 
+function previewHeader(pageKey, occ, total) {
+  const isMilestone = /^m/i.test(pageKey);
+  const page = pageKey.replace(/^m/i, '');
+  return `🧪 <b>معاينة سؤال ${occ + 1}/${total} (${isMilestone ? 'محطة ' : 'صفحة '}${page}):</b>\n`;
+}
+
 // بيبعت سؤال معاينة واحد. pageKey زي "5" لأسئلة صفحة، أو "m21" لأسئلة محطة.
 async function sendPreviewQuestion(chatId, pageKey, occ, quizzes) {
   const isMilestone = /^m/i.test(pageKey);
   const page = pageKey.replace(/^m/i, '');
   const quiz = quizzes[occ];
-  const title = `🧪 <b>معاينة سؤال ${occ + 1}/${quizzes.length} (${isMilestone ? 'محطة ' : 'صفحة '}${page}):</b>`;
+  const title = previewHeader(pageKey, occ, quizzes.length).trimEnd();
 
   if (quiz.type === 'complete') {
     await telegram.sendMessage(chatId, `${title}\n🎙️ ${quiz.question}`, {
@@ -297,6 +333,135 @@ async function getPreviewQuizzes(pageKey) {
 
 // /stats -> إحصائيات سريعة عن المستخدمين (ليكي إنتي بس). قراءة بس، مفيش أي كتابة.
 const FINAL_PAGE = 49; // لازم تفضل زي FINAL_PAGE في api/cron.js
+
+// ---------- تنظيف الموقّفين (ليكي إنتي بس) ----------
+// الموقّف = قفل الإرسال بـ /stop ولسه ما خلّصش السورة. بنعتمد على last_sent_date كتاريخ تقريبي للوقف.
+const WARN_AFTER_DAYS = 7; // بعد كام يوم من الوقف نبعتله تنبيه
+const GRACE_DAYS = 7; // المهلة بعد التنبيه قبل ما نفضّي مكانه
+const PAUSED_WARNING_TEXT =
+  '🌿 أهلًا بيك!\n\n' +
+  'إنت موقّف الإرسال اليومي من فترة. لو لسه حابب تكمل رحلتك مع سورة البقرة اضغط /resume وهتكمل من حيث وقفت.\n\n' +
+  `ولو مش هتكمل دلوقتي، هنفضّي مكانك بعد ${GRACE_DAYS} أيام عشان حد تاني يستفيد، وتقدر ترجع في أي وقت لو فيه مكان 🤍`;
+
+function esc(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function daysSince(dateStr, todayStr) {
+  const t = Date.parse(String(dateStr).slice(0, 10));
+  if (!t) return null;
+  return Math.floor((Date.parse(todayStr) - t) / 86400000);
+}
+
+function classifyPaused(users) {
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const c = { all: [], recent: [], toWarn: [], inGrace: [], toRemove: [], unknown: [], oldestDays: null, todayStr };
+  for (const u of users) {
+    if (u.subscribed || u.currentPage > FINAL_PAGE || isOwner(u.telegramId)) continue;
+    c.all.push(u);
+    if (u.warnedAt) {
+      const blocked = u.warnedAt.includes('blocked'); // مش بيوصله تنبيه (حاظر البوت)
+      const d = daysSince(u.warnedAt, todayStr);
+      if (blocked || (d !== null && d >= GRACE_DAYS)) c.toRemove.push(u);
+      else c.inGrace.push(u);
+      continue;
+    }
+    const d = daysSince(u.lastSentDate, todayStr);
+    if (d === null) {
+      c.unknown.push(u);
+      continue;
+    }
+    if (c.oldestDays === null || d > c.oldestDays) c.oldestDays = d;
+    if (d >= WARN_AFTER_DAYS) c.toWarn.push(u);
+    else c.recent.push(u);
+  }
+  return c;
+}
+
+// /inactive -> ملخص الموقّفين (قراءة بس)
+async function handleOwnerInactive(chatId) {
+  const c = classifyPaused(await sheets.getAllUsers());
+  if (c.all.length === 0) {
+    await telegram.sendMessage(chatId, '⏸️ مفيش مستخدمين موقّفين دلوقتي 🌿');
+    return;
+  }
+  await telegram.sendMessage(
+    chatId,
+    `⏸️ <b>الموقّفين: ${c.all.length}</b>\n\n` +
+      `🕐 وقفوا من أقل من ${WARN_AFTER_DAYS} أيام: ${c.recent.length}\n` +
+      `✉️ جاهزين للتنبيه (/warn): ${c.toWarn.length}\n` +
+      `⏳ اتنبّهوا وفي المهلة: ${c.inGrace.length}\n` +
+      `🧹 جاهزين للمسح (/cleanup): ${c.toRemove.length}\n` +
+      `❔ تاريخهم مش معروف: ${c.unknown.length}` +
+      (c.oldestDays !== null ? `\n\nأقدم واحد وقف من حوالي ${c.oldestDays} يوم.` : '')
+  );
+}
+
+// /warn -> يبعت تنبيه للموقّفين اللي بقالهم أكتر من WARN_AFTER_DAYS ويسجّل التاريخ
+async function handleOwnerWarn(chatId) {
+  const c = classifyPaused(await sheets.getAllUsers());
+  if (c.toWarn.length === 0) {
+    await telegram.sendMessage(chatId, 'مفيش حد محتاج تنبيه دلوقتي 🌿');
+    return;
+  }
+  if (!(await sheets.progressHasColumn('warned_at'))) {
+    await telegram.sendMessage(
+      chatId,
+      'محتاجة تضيفي عمود جديد في تاب Progress اسمه warned_at (اكتبيه في أول خانة فاضية في صف العناوين بعد pinned_seen)، وبعدين جرّبي /warn تاني. لسه ما بعتّش حاجة لأي حد.'
+    );
+    return;
+  }
+
+  const batch = c.toWarn.slice(0, 40); // نص دفعة صغيرة عشان الأمان
+  const entries = [];
+  const unreachable = [];
+  let sent = 0;
+  for (const u of batch) {
+    const r = await telegram.sendMessage(u.chatId, PAUSED_WARNING_TEXT);
+    if (r && r.ok) {
+      sent += 1;
+      entries.push({ telegramId: u.telegramId, value: c.todayStr });
+    } else {
+      unreachable.push(u);
+      entries.push({ telegramId: u.telegramId, value: `${c.todayStr} blocked` });
+    }
+  }
+  await sheets.markWarnedBatch(entries);
+
+  let msg = `✉️ اتبعت تنبيه لـ ${sent} مستخدم. هيتنضّفوا بعد ${GRACE_DAYS} أيام لو ما رجعوش.`;
+  if (unreachable.length > 0) {
+    msg += `\n\n🚫 ${unreachable.length} مش بيوصلهم (غالبًا حاظرين البوت)، وجاهزين للمسح على طول:\n` +
+      unreachable.slice(0, 10).map((u) => `• ${esc(u.name || u.telegramId)}`).join('\n');
+  }
+  if (c.toWarn.length > batch.length) {
+    msg += `\n\nفاضل ${c.toWarn.length - batch.length} لسه، اكتبي /warn تاني.`;
+  }
+  await telegram.sendMessage(chatId, msg);
+}
+
+// /cleanup -> يعرض مين جاهز للمسح، و /cleanup confirm يمسح صفوفهم فعلًا
+async function handleOwnerCleanup(chatId, arg) {
+  const c = classifyPaused(await sheets.getAllUsers());
+  if (c.toRemove.length === 0) {
+    await telegram.sendMessage(
+      chatId,
+      `مفيش حد جاهز للمسح دلوقتي 🌿${c.inGrace.length ? `\n(فيه ${c.inGrace.length} لسه في مهلة الـ ${GRACE_DAYS} أيام)` : ''}`
+    );
+    return;
+  }
+  if (String(arg || '').toLowerCase() !== 'confirm') {
+    const sample = c.toRemove.slice(0, 10).map((u) => `• ${esc(u.name || u.telegramId)}${u.warnedAt.includes('blocked') ? ' (حاظر البوت)' : ''}`).join('\n');
+    await telegram.sendMessage(
+      chatId,
+      `🧹 <b>جاهزين للمسح: ${c.toRemove.length}</b>\n\n${sample}\n\n` +
+        'المسح بيشيل صفوفهم من Progress وتقدمهم بيضيع نهائيًا.\n' +
+        'لو متأكدة اكتبي: /cleanup confirm\n(الأحسن تعمليه في وقت هادي)'
+    );
+    return;
+  }
+  const removed = await sheets.deleteUsers(c.toRemove.map((u) => u.telegramId));
+  await telegram.sendMessage(chatId, `🧹 اتمسح ${removed} مستخدم موقّف، واتفضّى ${removed} مكان 🌿`);
+}
 
 async function handleOwnerStats(chatId) {
   const users = await sheets.getAllUsers();
@@ -368,7 +533,7 @@ async function handleQuizPreviewAnswer(telegramId, chatId, parts, callbackQueryI
   }
   const correct = chosen === quiz.correct;
   await telegram.answerCallbackQuery(callbackQueryId, correct ? '✅ صح!' : '❌ غلط');
-  await telegram.clearKeyboard(chatId, messageId);
+  await telegram.finishQuestionMessage(chatId, messageId, previewHeader(pageKey, occ, quizzes.length), quiz, chosen);
   await telegram.sendAnswerFeedback(chatId, quiz, correct);
   if (occ + 1 < quizzes.length) await sendPreviewQuestion(chatId, pageKey, occ + 1, quizzes);
 }
@@ -382,8 +547,14 @@ async function handleQuizPreviewDone(telegramId, chatId, parts, callbackQueryId,
   const [, pageKey, occRaw] = parts;
   const occ = parseInt(occRaw, 10);
   await telegram.answerCallbackQuery(callbackQueryId, '🌿 تمام');
-  await telegram.clearKeyboard(chatId, messageId);
   const quizzes = await getPreviewQuizzes(pageKey);
+  const quiz = quizzes[occ];
+  if (quiz) {
+    await telegram.finishQuestionMessage(chatId, messageId, previewHeader(pageKey, occ, quizzes.length), quiz);
+    await telegram.sendMessage(chatId, selfCheckDoneText(quiz));
+  } else {
+    await telegram.clearKeyboard(chatId, messageId);
+  }
   if (occ + 1 < quizzes.length) await sendPreviewQuestion(chatId, pageKey, occ + 1, quizzes);
 }
 
@@ -482,15 +653,15 @@ module.exports = async (req, res) => {
         await handleQuickCheckDone(chatId, cq.id, parts[1], occurrence, messageId);
       } else if (type === 'review') {
         const [, chosen] = parts;
-        await handleReviewAnswer(telegramId, chatId, chosen, cq.id);
+        await handleReviewAnswer(telegramId, chatId, chosen, cq.id, messageId);
       } else if (type === 'reviewdone') {
-        await handleReviewDone(telegramId, chatId, cq.id);
+        await handleReviewDone(telegramId, chatId, cq.id, messageId);
       } else if (type === 'reviewchoice') {
         const [, choice] = parts;
         await handleReviewChoice(telegramId, chatId, choice, cq.id);
       } else if (type === 'milestone') {
         const [, chosen] = parts;
-        await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id);
+        await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id, messageId);
       } else if (type === 'today') {
         await telegram.answerCallbackQuery(cq.id, '📖');
         await handleToday(telegramId, chatId);
@@ -519,6 +690,12 @@ module.exports = async (req, res) => {
     // أوامر المعاينة: شغالة لحسابك إنتي بس، وأي حد تاني بيكمل عادي في الردود اللي تحت
     const [rawCmd, cmdArg] = text.split(/\s+/);
     const cmd = rawCmd.split('@')[0].toLowerCase();
+    if (['/inactive', '/warn', '/cleanup'].includes(cmd) && isOwner(telegramId)) {
+      if (cmd === '/inactive') await handleOwnerInactive(chatId);
+      else if (cmd === '/warn') await handleOwnerWarn(chatId);
+      else await handleOwnerCleanup(chatId, cmdArg);
+      return res.status(200).send('OK');
+    }
     if (cmd === '/stats' && isOwner(telegramId)) {
       await handleOwnerStats(chatId);
       return res.status(200).send('OK');
