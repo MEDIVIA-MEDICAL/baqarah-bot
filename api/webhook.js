@@ -21,6 +21,51 @@ const ACCESS_INVALID_TEXT =
   'لو كنت بتكتب كود دخول، فهو مش صحيح أو اتستخدم قبل كده 🌿\n' +
   'ولو محتاج كود، تواصل مع القائمين على البوت.';
 
+// ---------- طلب دخول بزرار ----------
+// لما العدد يكتمل، المستخدم بيلاقي زرار "اطلب دخول". بيوصلك إشعار فيه اسمه وزرار قبول/رفض.
+const ACCESS_NOTIFY_CAP = 30; // أقصى عدد إشعارات طلبات في اليوم (الباقي بيتسجل وتشوفيه في /requests)
+const REQUEST_BUTTON = { text: '📩 اطلب دخول', callback_data: 'reqaccess' };
+const requestCooldown = new Map(); // لو تاب Requests مش موجود: منع تكرار الإشعار من نفس الشخص
+
+function sendAccessMessage(chatId, text) {
+  return telegram.sendMessage(chatId, text, {
+    reply_markup: { inline_keyboard: [[REQUEST_BUTTON]] },
+  });
+}
+
+function ownerIds() {
+  return String(process.env.OWNER_TELEGRAM_ID || '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function requestKeyboard(targetId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ قبول', callback_data: `approve:${targetId}` },
+        { text: '❌ رفض', callback_data: `reject:${targetId}` },
+      ],
+    ],
+  };
+}
+
+function requestText(req) {
+  return (
+    '📩 <b>طلب دخول</b>\n\n' +
+    `👤 ${esc(req.name || 'بدون اسم')}\n` +
+    (req.username ? `🔗 @${esc(req.username)}\n` : '') +
+    `🆔 ${req.telegramId}`
+  );
+}
+
+async function notifyOwnersOfRequest(req) {
+  for (const id of ownerIds()) {
+    await telegram.sendMessage(id, requestText(req), { reply_markup: requestKeyboard(req.telegramId) });
+  }
+}
+
 // بتحدد المستخدم مسجل ولا لأ، والتسجيل الجديد مفتوح ولا العدد اكتمل (المالك دايمًا مسموح له)
 async function registrationStatus(telegramId) {
   if (isOwner(telegramId)) return { registered: true, full: false };
@@ -87,18 +132,24 @@ async function advanceReview(telegramId, chatId, scoreIncrement) {
   const newScore = user.reviewScore + scoreIncrement;
   const newIndex = user.reviewQuestionIndex + 1;
 
-  // لسه فيه أسئلة في الكويز
-  if (newIndex < user.reviewQueue.length) {
+  // لسه فيه أسئلة في الكويز (ولو سؤال اتمسح من الشيت بنعديه بدل ما البوت يقف)
+  let nextIndex = newIndex;
+  let nextQuiz = null;
+  while (nextIndex < user.reviewQueue.length) {
+    const [nextPage, nextOccurrence] = user.reviewQueue[nextIndex].split(':');
+    nextQuiz = await sheets.getQuizByPageOccurrence(nextPage, parseInt(nextOccurrence, 10));
+    if (nextQuiz) break;
+    nextIndex += 1;
+  }
+  if (nextQuiz) {
     await sheets.updateUserFields(telegramId, {
       reviewScore: newScore,
-      reviewQuestionIndex: newIndex,
+      reviewQuestionIndex: nextIndex,
     });
-    const [nextPage, nextOccurrence] = user.reviewQueue[newIndex].split(':');
-    const nextQuiz = await sheets.getQuizByPageOccurrence(nextPage, parseInt(nextOccurrence, 10));
     if (nextQuiz.type === 'complete') {
-      await telegram.sendReviewSelfCheck(chatId, nextQuiz, newIndex + 1, user.reviewQueue.length);
+      await telegram.sendReviewSelfCheck(chatId, nextQuiz, nextIndex + 1, user.reviewQueue.length);
     } else {
-      await telegram.sendReviewQuestion(chatId, nextQuiz, newIndex + 1, user.reviewQueue.length);
+      await telegram.sendReviewQuestion(chatId, nextQuiz, nextIndex + 1, user.reviewQueue.length);
     }
     return;
   }
@@ -225,14 +276,22 @@ async function handleMilestoneAnswer(telegramId, chatId, chosen, callbackQueryId
   const newScore = user.milestoneScore + (correct ? 1 : 0);
   const newIndex = user.milestoneQuestionIndex + 1;
 
-  if (newIndex < user.milestoneQueue.length) {
+  let nextIndex = newIndex;
+  let nextQuiz = null;
+  while (nextIndex < user.milestoneQueue.length) {
+    nextQuiz = await sheets.getMilestoneQuizByOccurrence(
+      user.milestonePage,
+      parseInt(user.milestoneQueue[nextIndex], 10)
+    );
+    if (nextQuiz) break;
+    nextIndex += 1; // سؤال اتمسح من الشيت، نعديه
+  }
+  if (nextQuiz) {
     await sheets.updateUserFields(telegramId, {
       milestoneScore: newScore,
-      milestoneQuestionIndex: newIndex,
+      milestoneQuestionIndex: nextIndex,
     });
-    const nextOccurrence = user.milestoneQueue[newIndex];
-    const nextQuiz = await sheets.getMilestoneQuizByOccurrence(user.milestonePage, parseInt(nextOccurrence, 10));
-    await telegram.sendMilestoneQuestion(chatId, nextQuiz, newIndex + 1, user.milestoneQueue.length);
+    await telegram.sendMilestoneQuestion(chatId, nextQuiz, nextIndex + 1, user.milestoneQueue.length);
     return;
   }
 
@@ -599,6 +658,133 @@ async function handleToday(telegramId, chatId) {
   await telegram.sendDailyPage(chatId, content);
 }
 
+// المستخدم ضغط "اطلب دخول"
+async function handleAccessRequest(cq, telegramId, chatId) {
+  const { registered, full } = await registrationStatus(telegramId);
+  if (registered) {
+    await telegram.answerCallbackQuery(cq.id, 'إنت مسجل بالفعل 🌿');
+    return;
+  }
+  if (!full) {
+    // اتفتح مكان من وقت ما الرسالة اتبعتت
+    await telegram.answerCallbackQuery(cq.id, '🌿');
+    await telegram.sendMessage(chatId, 'فيه مكان متاح دلوقتي 🌿 اكتب /start وابدأ رحلتك.');
+    return;
+  }
+
+  const name = [cq.from.first_name, cq.from.last_name].filter(Boolean).join(' ') || String(telegramId);
+  const username = cq.from.username || '';
+  let record = null;
+  try {
+    record = await sheets.addAccessRequest({ telegramId, name, username });
+  } catch (err) {
+    console.error('addAccessRequest failed:', err.message);
+  }
+
+  if (record && !record.created) {
+    await telegram.answerCallbackQuery(cq.id, '🌿');
+    await telegram.sendMessage(
+      chatId,
+      record.status === 'rejected'
+        ? 'نعتذر، مفيش مكان متاح حاليًا 🌿 ولو معاك كود دخول ابعته هنا.'
+        : 'طلبك وصل قبل كده 🌿 هيتراجع وهيجيلك رد هنا إن شاء الله.'
+    );
+    return;
+  }
+
+  if (!record) {
+    // تاب Requests مش موجود: على الأقل نمنع تكرار الإشعار من نفس الشخص
+    const last = requestCooldown.get(String(telegramId)) || 0;
+    if (Date.now() - last < 60 * 1000) {
+      await telegram.answerCallbackQuery(cq.id, '🌿');
+      return;
+    }
+    requestCooldown.set(String(telegramId), Date.now());
+  }
+
+  await telegram.answerCallbackQuery(cq.id, '📩 وصل طلبك');
+  await telegram.sendMessage(chatId, 'وصل طلبك 🌿 هيتراجع وهيجيلك رد هنا إن شاء الله.');
+
+  const todayCount = record ? record.todayCount : 0;
+  if (todayCount <= ACCESS_NOTIFY_CAP) {
+    await notifyOwnersOfRequest({ telegramId, name, username });
+  } else if (todayCount === ACCESS_NOTIFY_CAP + 1) {
+    for (const id of ownerIds()) {
+      await telegram.sendMessage(
+        id,
+        `📩 وصلت لحد إشعارات الطلبات النهاردة (${ACCESS_NOTIFY_CAP}). باقي الطلبات بيتسجل، شوفيها بـ /requests`
+      );
+    }
+  }
+}
+
+// أنتِ ضغطتي قبول أو رفض على طلب
+async function handleAccessDecision(action, targetId, cq, telegramId, chatId) {
+  if (!isOwner(telegramId)) {
+    await telegram.answerCallbackQuery(cq.id, '🌿');
+    return;
+  }
+  const messageId = cq.message.message_id;
+
+  let record = null;
+  try {
+    record = await sheets.getAccessRequest(targetId);
+  } catch (err) {
+    console.error('getAccessRequest failed:', err.message);
+  }
+
+  if (action === 'reject') {
+    await telegram.answerCallbackQuery(cq.id, 'اترفض');
+    try {
+      await sheets.setAccessRequestStatus(targetId, 'rejected');
+    } catch (err) {
+      console.error('setAccessRequestStatus failed:', err.message);
+    }
+    await telegram.sendMessage(targetId, 'نعتذر، مفيش مكان متاح حاليًا 🌿 ولو معاك كود دخول ابعته هنا.');
+    await telegram.editMessageText(
+      chatId,
+      messageId,
+      `❌ اترفض: ${esc((record && record.name) || targetId)} (${targetId})`
+    );
+    return;
+  }
+
+  // approve
+  const { registered } = await registrationStatus(targetId);
+  if (registered) {
+    await telegram.answerCallbackQuery(cq.id, 'متسجل بالفعل');
+    await telegram.editMessageText(chatId, messageId, `✅ ده متسجل بالفعل (${targetId})`);
+    return;
+  }
+  let name = record && record.name;
+  if (!name) {
+    const info = await telegram.getChatInfo(targetId);
+    name = [info.first_name, info.last_name].filter(Boolean).join(' ') || String(targetId);
+  }
+  await telegram.answerCallbackQuery(cq.id, '✅ اتقبل');
+  await telegram.sendMessage(targetId, '🎉 تم قبول طلبك! أهلًا بيك في رحلة حفظ سورة البقرة 🌿');
+  await handleStart(targetId, targetId, name);
+  try {
+    await sheets.setAccessRequestStatus(targetId, 'approved');
+  } catch (err) {
+    console.error('setAccessRequestStatus failed:', err.message);
+  }
+  await telegram.editMessageText(chatId, messageId, `✅ اتقبل: ${esc(name)} (${targetId})`);
+}
+
+// /requests -> الطلبات المستنية (أول 5 بأزرار قبول/رفض)
+async function handleOwnerRequests(chatId) {
+  const { total, items } = await sheets.getPendingRequests(5);
+  if (total === 0) {
+    await telegram.sendMessage(chatId, 'مفيش طلبات مستنية دلوقتي 🌿');
+    return;
+  }
+  await telegram.sendMessage(chatId, `📩 طلبات مستنية: ${total}${total > items.length ? ` (هعرضلك أول ${items.length})` : ''}`);
+  for (const item of items) {
+    await telegram.sendMessage(chatId, requestText(item), { reply_markup: requestKeyboard(item.telegramId) });
+  }
+}
+
 // تسجيل/ترحيب بمستخدم (جديد أو قديم) عند /start
 async function handleStart(telegramId, chatId, name) {
   const user = await sheets.upsertUser({ telegramId, chatId, name, startPage: 1 });
@@ -625,9 +811,31 @@ async function handleStart(telegramId, chatId, name) {
   }
 }
 
+// تنبيه ليكي لو حصل خطأ في الـ webhook (مرة كل 10 دقايق بالكتير عشان ما يتكررش)
+let lastErrorAlertAt = 0;
+async function alertOwnerOfError(err) {
+  if (Date.now() - lastErrorAlertAt < 10 * 60 * 1000) return;
+  lastErrorAlertAt = Date.now();
+  const msg = String((err && err.message) || err).slice(0, 300);
+  for (const id of ownerIds()) {
+    try {
+      await telegram.sendMessage(id, `⚠️ <b>خطأ في البوت</b>\n\n${esc(msg)}`);
+    } catch (e) {
+      console.error('alertOwnerOfError failed:', e.message);
+    }
+  }
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
     return res.status(200).send('OK - webhook is alive');
+  }
+
+  // حماية اختيارية: لو TELEGRAM_WEBHOOK_SECRET متضاف في Vercel، بنقبل بس الطلبات اللي جاية من تيليجرام
+  // (لازم تكوني ضبطتي نفس الكلمة في setWebhook عن طريق secret_token)
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (webhookSecret && req.headers['x-telegram-bot-api-secret-token'] !== webhookSecret) {
+    return res.status(401).send('Unauthorized');
   }
 
   try {
@@ -662,6 +870,10 @@ module.exports = async (req, res) => {
       } else if (type === 'milestone') {
         const [, chosen] = parts;
         await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id, messageId);
+      } else if (type === 'reqaccess') {
+        await handleAccessRequest(cq, telegramId, chatId);
+      } else if (type === 'approve' || type === 'reject') {
+        await handleAccessDecision(type, parts[1], cq, telegramId, chatId);
       } else if (type === 'today') {
         await telegram.answerCallbackQuery(cq.id, '📖');
         await handleToday(telegramId, chatId);
@@ -690,6 +902,10 @@ module.exports = async (req, res) => {
     // أوامر المعاينة: شغالة لحسابك إنتي بس، وأي حد تاني بيكمل عادي في الردود اللي تحت
     const [rawCmd, cmdArg] = text.split(/\s+/);
     const cmd = rawCmd.split('@')[0].toLowerCase();
+    if (cmd === '/requests' && isOwner(telegramId)) {
+      await handleOwnerRequests(chatId);
+      return res.status(200).send('OK');
+    }
     if (['/inactive', '/warn', '/cleanup'].includes(cmd) && isOwner(telegramId)) {
       if (cmd === '/inactive') await handleOwnerInactive(chatId);
       else if (cmd === '/warn') await handleOwnerWarn(chatId);
@@ -711,7 +927,7 @@ module.exports = async (req, res) => {
         // العدد اكتمل: الدخول بكود بس (/start الكود، أو الكود في رسالة لوحده)
         const ok = cmdArg ? await sheets.redeemInviteCode(cmdArg, telegramId) : false;
         if (!ok) {
-          await telegram.sendMessage(chatId, cmdArg ? ACCESS_INVALID_TEXT : ACCESS_FULL_TEXT);
+          await sendAccessMessage(chatId, cmdArg ? ACCESS_INVALID_TEXT : ACCESS_FULL_TEXT);
           return res.status(200).send('OK');
         }
       }
@@ -764,7 +980,7 @@ module.exports = async (req, res) => {
         await handleStart(telegramId, chatId, name);
         return res.status(200).send('OK');
       }
-      await telegram.sendMessage(chatId, text.startsWith('/') ? ACCESS_FULL_TEXT : ACCESS_INVALID_TEXT);
+      await sendAccessMessage(chatId, text.startsWith('/') ? ACCESS_FULL_TEXT : ACCESS_INVALID_TEXT);
       return res.status(200).send('OK');
     }
 
@@ -772,6 +988,7 @@ module.exports = async (req, res) => {
     return res.status(200).send('OK');
   } catch (err) {
     console.error('Webhook error:', err);
+    await alertOwnerOfError(err);
     return res.status(200).send('OK'); // نرجع OK دايمًا عشان تيليجرام متعملش retry لا نهائي
   }
 };

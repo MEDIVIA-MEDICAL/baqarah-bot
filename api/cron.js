@@ -246,7 +246,23 @@ async function notifyOwner(text) {
 }
 
 // بيعالج مستخدم واحد. بيرجع true لو اتعدّ كمرسَل (نفس منطق الكرون القديم بالظبط).
+let blockedThisBatch = 0;
+
+// لو المستخدم حاظر البوت، بنوقّف الإرسال ليه (لو رجع وكتب /start بيرجع تلقائي)
 async function processUser(user, todayStr) {
+  const result = await processUserInner(user, todayStr);
+  if (telegram.consumeBlocked(user.chatId)) {
+    blockedThisBatch += 1;
+    try {
+      await sheets.setSubscribed(user.telegramId, false);
+    } catch (err) {
+      console.error('Failed to pause blocked user:', err.message);
+    }
+  }
+  return result;
+}
+
+async function processUserInner(user, todayStr) {
   // المستخدم لسه وسط كويز مراجعة مجاوبوش خالص
   if (user.reviewQueue.length > 0 && user.reviewQuestionIndex < user.reviewQueue.length) {
     await nudgeReviewQuestion(user);
@@ -463,6 +479,7 @@ async function runBatch(req, depth) {
     const sentToday = users.length - pending.length + sentCount;
     let summary = `✅ <b>الكرون خلص النهاردة</b>\n\n📨 اتبعت لـ ${sentToday} من ${users.length} مشترك نشط`;
     if (skippedCount > 0) summary += `\n⏸️ ${skippedCount} واقفين لأن محتوى صفحتهم لسه مش مضاف`;
+    if (blockedThisBatch > 0) summary += `\n🚫 ${blockedThisBatch} حاظرين البوت (اتوقّف الإرسال ليهم)`;
     if (failedCount > 0) summary += `\n❌ ${failedCount} فشلوا (هيتحاولوا تاني)`;
     await notifyOwner(summary);
   }
