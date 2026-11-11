@@ -31,6 +31,24 @@ const TIME_BUDGET_MS = 40 * 1000;
 const CONCURRENCY = 3; // عدد المستخدمين اللي بيتعالجوا مع بعض (قليل عشان حدود جوجل وتيليجرام)
 const MAX_CHAIN_DEPTH = 40; // حماية من أي تسلسل لا نهائي
 
+// ---------- حماية حد جوجل (60 قراءة و60 كتابة في الدقيقة) ----------
+// نكتب في الشيت بمعدل أقل من 40 كتابة في الدقيقة (الباقي لضغطات المستخدمين)،
+// ونقرا الشيت مرة كل CHUNK_SIZE مستخدم بدل مرة لكل مستخدم.
+const WRITE_INTERVAL_MS = 1500;
+const CHUNK_SIZE = 15;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let nextWriteAt = 0;
+
+// بيحفظ تقدم مستخدم في الشيت (بالصف اللي في إيدنا، من غير قراءة تانية) وبينظّم سرعة الكتابة
+async function saveUser(user, fields) {
+  const now = Date.now();
+  const at = Math.max(now, nextWriteAt);
+  nextWriteAt = at + WRITE_INTERVAL_MS;
+  if (at > now) await sleep(at - now);
+  return sheets.updateUserFields(user.telegramId, fields, user.row);
+}
+
 // آخر صفحة في المحتوى (سورة البقرة بتخلص في صفحة 49). أول ما المستخدم يخلّص مراجعة آخر بلوك
 // ويوصل لصفحة بعدها، بيستلم رسالة الختام مرة واحدة وبيتوقف الإرسال اليومي ليه.
 // (ممكن تعدّلي نص الرسالة هنا زي ما تحبي)
@@ -75,7 +93,7 @@ async function startReviewDay(user) {
       user.chatId,
       `🌟 خلصت صفحات ${pages[0]}-${pages[2]}! (مفيش أسئلة مراجعة متضافة لسه، هنكمل عادي).`
     );
-    await sheets.updateUserFields(user.telegramId, {
+    await saveUser(user, {
       currentPage: pages[2] + 1,
       blockStartPage: pages[2] + 1,
       cycleDay: 1,
@@ -94,7 +112,7 @@ async function startReviewDay(user) {
       'قبل ما تجاوب، جرّب تسمّع الصفحات التلاتة بصوت عالي من غير مساعدة.'
   );
 
-  await sheets.updateUserFields(user.telegramId, {
+  await saveUser(user, {
     reviewQueue: queue,
     reviewQuestionIndex: 0,
     reviewScore: 0,
@@ -126,7 +144,7 @@ async function sendCombinedRepeatDay(user) {
     }
   }
 
-  await sheets.updateUserFields(user.telegramId, {
+  await saveUser(user, {
     currentPage: pages[2] + 1,
     blockStartPage: pages[2] + 1,
     cycleDay: 1,
@@ -141,7 +159,7 @@ async function startMilestoneDay(user) {
 
   if (quizzes.length === 0) {
     // مفيش أسئلة متضافة لصفحة المحطة دي لسه - نعدي عادي
-    await sheets.updateUserFields(user.telegramId, {
+    await saveUser(user, {
       cycleDay: resumeDay,
       milestonePage: '',
       pendingResumeDay: '',
@@ -157,7 +175,7 @@ async function startMilestoneDay(user) {
       'ده اختبار تثبيت إضافي بس، مفيش أي إيقاف حتى لو النتيجة مش كويسة 🌿'
   );
 
-  await sheets.updateUserFields(user.telegramId, {
+  await saveUser(user, {
     milestoneQueue: queue,
     milestoneQuestionIndex: 0,
     milestoneScore: 0,
@@ -232,21 +250,21 @@ async function processUser(user, todayStr) {
   // المستخدم لسه وسط كويز مراجعة مجاوبوش خالص
   if (user.reviewQueue.length > 0 && user.reviewQuestionIndex < user.reviewQueue.length) {
     await nudgeReviewQuestion(user);
-    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    await saveUser(user, { lastSentDate: todayStr });
     return true;
   }
 
   // المستخدم لسه وسط اختبار محطة مجاوبوش خالص
   if (user.milestoneQueue.length > 0 && user.milestoneQuestionIndex < user.milestoneQueue.length) {
     await nudgeMilestoneQuestion(user);
-    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    await saveUser(user, { lastSentDate: todayStr });
     return true;
   }
 
   // المستخدم لسه مقررش يعيد ولا يكمل بعد نتيجة مراجعة ضعيفة
   if (user.pendingChoice === 'low_score') {
     await telegram.sendRepeatChoiceReminder(user.chatId);
-    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    await saveUser(user, { lastSentDate: todayStr });
     return true;
   }
 
@@ -254,19 +272,19 @@ async function processUser(user, todayStr) {
 
   if (day === 9) {
     await startMilestoneDay(user);
-    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    await saveUser(user, { lastSentDate: todayStr });
     return true;
   }
 
   if (day === 8) {
     await sendCombinedRepeatDay(user);
-    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    await saveUser(user, { lastSentDate: todayStr });
     return true;
   }
 
   if (day === 7) {
     await startReviewDay(user);
-    await sheets.updateUserFields(user.telegramId, { lastSentDate: todayStr });
+    await saveUser(user, { lastSentDate: todayStr });
     return true;
   }
 
@@ -283,7 +301,7 @@ async function processUser(user, todayStr) {
     if (!sent) return false; // خلصت الصفحات، متتحركش
     // يوم 1 هو أول يوم في البلوك، نسجل بداية البلوك هنا
     const updates = { ...progressAfterNewPage(user, day), lastSentDate: todayStr };
-    await sheets.updateUserFields(user.telegramId, updates);
+    await saveUser(user, updates);
     return true;
   }
 
@@ -306,7 +324,7 @@ async function processUser(user, todayStr) {
   if (day === 2 || day === 4) {
     updates.currentPage = user.currentPage + 1;
   }
-  await sheets.updateUserFields(user.telegramId, updates);
+  await saveUser(user, updates);
   return true;
 }
 
@@ -345,7 +363,18 @@ async function runBatch(req, depth) {
   const startedAt = Date.now();
   const todayStr = new Date().toISOString().slice(0, 10);
 
-  const users = await sheets.getAllSubscribedUsers();
+  let users;
+  try {
+    users = await sheets.getAllSubscribedUsers();
+  } catch (err) {
+    // غالبًا حد جوجل خلص: بنكمل في دفعة جديدة بعد ما نستنى (القراءة نفسها بتحاول كذا مرة)
+    console.error('Cron initial read failed:', err);
+    if (depth < MAX_CHAIN_DEPTH) {
+      const next = await triggerNextBatch(req, depth + 1);
+      if (next.ok) return { ok: false, retried: true, depth };
+    }
+    throw err;
+  }
   const pending = users.filter((u) => u.lastSentDate !== todayStr);
 
   let sentCount = 0;
@@ -354,11 +383,41 @@ async function runBatch(req, depth) {
   let nextIndex = 0;
   const failures = [];
 
+  // نسخة الصفوف الطازة: بنجدّدها كل CHUNK_SIZE مستخدم (قراءة واحدة لكل مجموعة)
+  let freshById = new Map(users.map((u) => [String(u.telegramId), u]));
+  let freshOk = true;
+  let currentChunk = 0;
+  let chunkReady = Promise.resolve();
+
+  async function refreshRows() {
+    try {
+      const fresh = await sheets.getAllSubscribedUsers();
+      freshById = new Map(fresh.map((u) => [String(u.telegramId), u]));
+      freshOk = true;
+    } catch (err) {
+      freshOk = false; // لو فشلنا نكمل بالصفوف اللي معانا
+      console.error('Cron chunk refresh failed:', err.message);
+    }
+  }
+
   async function worker() {
     while (Date.now() - startedAt < TIME_BUDGET_MS) {
       const i = nextIndex++;
       if (i >= pending.length) return;
-      const user = pending[i];
+      const chunk = Math.floor(i / CHUNK_SIZE);
+      if (chunk !== currentChunk) {
+        currentChunk = chunk;
+        chunkReady = refreshRows();
+      }
+      await chunkReady;
+
+      let user = freshById.get(String(pending[i].telegramId));
+      if (!user) {
+        if (freshOk) continue; // وقّف الإرسال أو اتمسح في الأثناء
+        user = pending[i];
+      }
+      if (user.lastSentDate === todayStr) continue; // اتبعتله خلاص
+
       try {
         if (await processUser(user, todayStr)) sentCount += 1;
         else skippedCount += 1;
