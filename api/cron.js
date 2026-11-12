@@ -26,27 +26,29 @@ try {
   waitUntil = null;
 }
 
-// إعدادات الدفعات: كل دفعة بتشتغل لحد 40 ثانية (من 60 المسموحة، والباقي هامش أمان)، وبعدها بتنده الدفعة اللي بعدها.
-const TIME_BUDGET_MS = 40 * 1000;
-const CONCURRENCY = 3; // عدد المستخدمين اللي بيتعالجوا مع بعض (قليل عشان حدود جوجل وتيليجرام)
+// إعدادات الدفعات: كل دفعة بتشتغل لحد 45 ثانية (من 60 المسموحة، والباقي هامش أمان)، وبعدها بتنده الدفعة اللي بعدها.
+// ملاحظة: Vercel بيمنع الدالة تنده نفسها أكتر من حوالي 4-5 مرات ورا بعض (خطأ 508)،
+// فمحتاجين كل دفعة تخلّص أكبر عدد ممكن من المستخدمين. عشان كده الكتابة في الشيت بقت جماعية.
+const TIME_BUDGET_MS = 45 * 1000;
+const CONCURRENCY = 6; // عدد المستخدمين اللي بيتعالجوا مع بعض (تيليجرام بيسمح بحوالي 30 رسالة في الثانية)
 const MAX_CHAIN_DEPTH = 40; // حماية من أي تسلسل لا نهائي
 
 // ---------- حماية حد جوجل (60 قراءة و60 كتابة في الدقيقة) ----------
-// نكتب في الشيت بمعدل أقل من 40 كتابة في الدقيقة (الباقي لضغطات المستخدمين)،
-// ونقرا الشيت مرة كل CHUNK_SIZE مستخدم بدل مرة لكل مستخدم.
-const WRITE_INTERVAL_MS = 1500;
-const CHUNK_SIZE = 15;
+// بنشتغل على مجموعات (CHUNK_SIZE مستخدم): قراءة واحدة للشيت في أول المجموعة، وكتابة واحدة في آخرها
+// لكل التعديلات مع بعض، بدل كتابة لكل مستخدم.
+const CHUNK_SIZE = 20;
+const FALLBACK_WRITE_INTERVAL_MS = 1500; // لو الكتابة الجماعية فشلت: كتابة صف صف بسرعة بطيئة
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-let nextWriteAt = 0;
 
-// بيحفظ تقدم مستخدم في الشيت (بالصف اللي في إيدنا، من غير قراءة تانية) وبينظّم سرعة الكتابة
+// بيسجّل تقدم مستخدم في الذاكرة بس؛ الحفظ في الشيت بيحصل لما المجموعة تخلص (flushDirty).
+// user.__dirty بيحطها runBatch. لو مش موجودة بنكتب فورًا (الطريقة القديمة).
 async function saveUser(user, fields) {
-  const now = Date.now();
-  const at = Math.max(now, nextWriteAt);
-  nextWriteAt = at + WRITE_INTERVAL_MS;
-  if (at > now) await sleep(at - now);
-  return sheets.updateUserFields(user.telegramId, fields, user.row);
+  if (!user.__dirty) {
+    return sheets.updateUserFields(user.telegramId, fields, user.row);
+  }
+  sheets.applyUserFields(user.row, fields);
+  user.__dirty.set(String(user.telegramId), user);
 }
 
 // آخر صفحة في المحتوى (سورة البقرة بتخلص في صفحة 49). أول ما المستخدم يخلّص مراجعة آخر بلوك
@@ -254,7 +256,7 @@ async function processUser(user, todayStr) {
   if (telegram.consumeBlocked(user.chatId)) {
     blockedThisBatch += 1;
     try {
-      await sheets.setSubscribed(user.telegramId, false);
+      await saveUser(user, { subscribed: 'FALSE' });
     } catch (err) {
       console.error('Failed to pause blocked user:', err.message);
     }
@@ -310,7 +312,7 @@ async function processUserInner(user, todayStr) {
     // خلّص كل الصفحات: رسالة الختام مرة واحدة، وبعدها نوقف الإرسال اليومي ليه
     if (user.currentPage > FINAL_PAGE) {
       await telegram.sendMessage(user.chatId, CLOSING_MESSAGE);
-      await sheets.setSubscribed(user.telegramId, false);
+      await saveUser(user, { subscribed: 'FALSE' });
       return true;
     }
     const sent = await sendNewPageDay(user);
@@ -396,14 +398,13 @@ async function runBatch(req, depth) {
   let sentCount = 0;
   let failedCount = 0;
   let skippedCount = 0; // مستخدمين واقفين لأن محتوى صفحتهم لسه مش مضاف في الشيت
-  let nextIndex = 0;
+  let processedCount = 0;
   const failures = [];
+  const writeProblems = [];
 
-  // نسخة الصفوف الطازة: بنجدّدها كل CHUNK_SIZE مستخدم (قراءة واحدة لكل مجموعة)
+  // نسخة الصفوف الطازة: بنجدّدها في أول كل مجموعة (قراءة واحدة لكل مجموعة)
   let freshById = new Map(users.map((u) => [String(u.telegramId), u]));
   let freshOk = true;
-  let currentChunk = 0;
-  let chunkReady = Promise.resolve();
 
   async function refreshRows() {
     try {
@@ -416,37 +417,65 @@ async function runBatch(req, depth) {
     }
   }
 
-  async function worker() {
-    while (Date.now() - startedAt < TIME_BUDGET_MS) {
-      const i = nextIndex++;
-      if (i >= pending.length) return;
-      const chunk = Math.floor(i / CHUNK_SIZE);
-      if (chunk !== currentChunk) {
-        currentChunk = chunk;
-        chunkReady = refreshRows();
-      }
-      await chunkReady;
-
-      let user = freshById.get(String(pending[i].telegramId));
-      if (!user) {
-        if (freshOk) continue; // وقّف الإرسال أو اتمسح في الأثناء
-        user = pending[i];
-      }
-      if (user.lastSentDate === todayStr) continue; // اتبعتله خلاص
-
-      try {
-        if (await processUser(user, todayStr)) sentCount += 1;
-        else skippedCount += 1;
-      } catch (err) {
-        // مستخدم واحد فشل متوقفش الباقي؛ هيتحاول تاني في الدفعة الجاية لأن lastSentDate متسجلش
-        failedCount += 1;
-        failures.push(`${user.telegramId}: ${err && err.message ? err.message : err}`);
-        console.error(`Cron error for user ${user.telegramId}:`, err);
+  // بيحفظ تعديلات المجموعة كلها في الشيت بطلب واحد. لو فشل بيكتب صف صف (أبطأ بس مضمون).
+  async function flushDirty(dirty) {
+    if (dirty.size === 0) return;
+    const entries = [...dirty.values()];
+    dirty.clear();
+    try {
+      await sheets.batchWriteRows(entries.map((u) => u.row));
+    } catch (err) {
+      console.error('Batch write failed, falling back to row-by-row:', err.message);
+      writeProblems.push(err.message);
+      for (const user of entries) {
+        try {
+          await sheets.saveRow(user.row);
+        } catch (rowErr) {
+          failedCount += 1; // ما اتسجلش، هيتحاول تاني (وممكن يستلم الصفحة مرتين)
+          failures.push(`${user.telegramId}: ${rowErr.message}`);
+        }
+        await sleep(FALLBACK_WRITE_INTERVAL_MS);
       }
     }
   }
 
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  async function processChunk(slice, dirty) {
+    let cursor = 0;
+    async function worker() {
+      while (true) {
+        const i = cursor++;
+        if (i >= slice.length) return;
+        let user = freshById.get(String(slice[i].telegramId));
+        if (!user) {
+          if (freshOk) continue; // وقّف الإرسال أو اتمسح في الأثناء
+          user = slice[i];
+        }
+        if (user.lastSentDate === todayStr) continue; // اتبعتله خلاص
+        user.__dirty = dirty;
+        try {
+          if (await processUser(user, todayStr)) sentCount += 1;
+          else skippedCount += 1;
+        } catch (err) {
+          // مستخدم واحد فشل متوقفش الباقي؛ هيتحاول تاني في الدفعة الجاية لأن lastSentDate متسجلش
+          failedCount += 1;
+          failures.push(`${user.telegramId}: ${err && err.message ? err.message : err}`);
+          console.error(`Cron error for user ${user.telegramId}:`, err);
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  }
+
+  for (let start = 0; start < pending.length; start += CHUNK_SIZE) {
+    if (Date.now() - startedAt >= TIME_BUDGET_MS) break;
+    if (start > 0) await refreshRows(); // أول مجموعة بتستخدم القراءة اللي حصلت في أول الدفعة
+    const slice = pending.slice(start, start + CHUNK_SIZE);
+    const dirty = new Map();
+    await processChunk(slice, dirty);
+    await flushDirty(dirty);
+    processedCount = start + slice.length;
+  }
+  const nextIndex = processedCount;
 
   const remaining = Math.max(0, pending.length - nextIndex);
   let chained = false;
@@ -455,6 +484,10 @@ async function runBatch(req, depth) {
   if (failedCount > 0) {
     const sample = failures.slice(0, 3).map(escapeHtml).join('\n');
     problems.push(`❌ ${failedCount} مستخدم فشل الإرسال ليهم (هيتحاول تاني في الدفعة الجاية):\n${sample}`);
+  }
+
+  if (writeProblems.length > 0) {
+    problems.push(`⚠️ الكتابة الجماعية في الشيت فشلت واشتغلت بالطريقة البطيئة:\n${escapeHtml(writeProblems[0])}`);
   }
 
   if (remaining > 0 && depth < MAX_CHAIN_DEPTH) {

@@ -4,7 +4,7 @@
 
 const sheets = require('../lib/sheets');
 const telegram = require('../lib/telegram');
-const { deliverFirstPage } = require('../lib/daily');
+const { deliverFirstPage, communityLine } = require('../lib/daily');
 
 // ---------- حد التسجيل ----------
 // أول MAX_FREE_USERS مستخدم بيدخلوا عادي. بعد كده الدخول بكود من تاب Invites في الشيت.
@@ -27,8 +27,9 @@ const ACCESS_NOTIFY_CAP = 30; // أقصى عدد إشعارات طلبات في 
 const REQUEST_BUTTON = { text: '📩 اطلب دخول', callback_data: 'reqaccess' };
 const requestCooldown = new Map(); // لو تاب Requests مش موجود: منع تكرار الإشعار من نفس الشخص
 
-function sendAccessMessage(chatId, text) {
-  return telegram.sendMessage(chatId, text, {
+async function sendAccessMessage(chatId, text) {
+  const community = await communityLine();
+  return telegram.sendMessage(chatId, community ? `${text}\n\n${community}` : text, {
     reply_markup: { inline_keyboard: [[REQUEST_BUTTON]] },
   });
 }
@@ -789,6 +790,7 @@ async function handleOwnerRequests(chatId) {
 async function handleStart(telegramId, chatId, name) {
   const user = await sheets.upsertUser({ telegramId, chatId, name, startPage: 1 });
   sheets.noteRegistered(telegramId);
+  const community = await communityLine();
   await telegram.sendMessage(
     chatId,
     `أهلًا بيك يا ${name} 🌿\n\n` +
@@ -796,6 +798,7 @@ async function handleStart(telegramId, chatId, name) {
       '📖 يوم صفحة جديدة (فيديو + صوت + خريطة ذهنية + تفسير)\n' +
       '🧩 يوم تثبيت عليها\n' +
       'وكل 3 صفحات هيجيلك يوم مراجعة شاملة عليهم كلهم.\n\n' +
+      (community ? `${community}\n\n` : '') +
       'لو الصفحة ماوصلتش أو عايز تشوفها تاني اضغط "ابعتلي صفحة اليوم" في الرسالة المثبتة أو اكتب /today.\n' +
       'ولو حابب توقف الإرسال اليومي مؤقتًا اكتب /stop، ولو عايز ترجعه اكتب /resume.'
   );
@@ -962,9 +965,11 @@ module.exports = async (req, res) => {
     if (text === '/status') {
       const progress = await sheets.getUserProgress(telegramId);
       if (progress) {
+        const community = await communityLine();
         await telegram.sendMessage(
           chatId,
-          `📊 إنت دلوقتي على صفحة ${progress.currentPage} (يوم ${progress.cycleDay} من دورة الـ 7 أيام).`
+          `📊 إنت دلوقتي على صفحة ${progress.currentPage} (يوم ${progress.cycleDay} من دورة الـ 7 أيام).` +
+            (community ? `\n\n${community}` : '')
         );
       } else {
         await telegram.sendMessage(chatId, 'ابعت /start الأول عشان نبدأ.');
