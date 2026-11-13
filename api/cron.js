@@ -32,6 +32,9 @@ try {
 const TIME_BUDGET_MS = 45 * 1000;
 const CONCURRENCY = 6; // عدد المستخدمين اللي بيتعالجوا مع بعض (تيليجرام بيسمح بحوالي 30 رسالة في الثانية)
 const MAX_CHAIN_DEPTH = 40; // حماية من أي تسلسل لا نهائي
+// لو فيه مستخدمين فشلوا (مثلًا انقطاع اتصال لحظي) بنعمل دفعة واحدة تانية بعد شوية تحاول معاهم
+const MAX_RETRY_DEPTH = 1;
+const RETRY_DELAY_SECONDS = 20;
 
 // ---------- حماية حد جوجل (60 قراءة و60 كتابة في الدقيقة) ----------
 // بنشتغل على مجموعات (CHUNK_SIZE مستخدم): قراءة واحدة للشيت في أول المجموعة، وكتابة واحدة في آخرها
@@ -347,7 +350,7 @@ async function processUserInner(user, todayStr) {
 }
 
 // بينده الدفعة اللي بعدها على نفس الرابط. الدفعة الجاية بترد فورًا (202) وتكمّل في الخلفية.
-async function triggerNextBatch(req, nextDepth) {
+async function triggerNextBatch(req, nextDepth, delaySeconds = 0) {
   // بنفضّل رابط الإنتاج الرسمي (بيكون مفتوح)، لأن رابط الـ deployment الفرعي ممكن يكون محمي من Vercel
   const host =
     process.env.VERCEL_PROJECT_PRODUCTION_URL || req.headers['x-forwarded-host'] || req.headers.host;
@@ -358,7 +361,7 @@ async function triggerNextBatch(req, nextDepth) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10 * 1000);
   try {
-    const r = await fetch(`${proto}://${host}/api/cron?chain=1&depth=${nextDepth}`, {
+    const r = await fetch(`${proto}://${host}/api/cron?chain=1&depth=${nextDepth}&delay=${delaySeconds}`, {
       headers,
       signal: controller.signal,
     });
@@ -483,7 +486,10 @@ async function runBatch(req, depth) {
 
   if (failedCount > 0) {
     const sample = failures.slice(0, 3).map(escapeHtml).join('\n');
-    problems.push(`❌ ${failedCount} مستخدم فشل الإرسال ليهم (هيتحاول تاني في الدفعة الجاية):\n${sample}`);
+    const willRetry = remaining > 0 || depth < MAX_RETRY_DEPTH;
+    problems.push(
+      `❌ ${failedCount} مستخدم فشل الإرسال ليهم (${willRetry ? 'هيتحاولوا تاني تلقائي بعد شوية' : 'اضغطي Run من Vercel عشان يتحاولوا تاني'}):\n${sample}`
+    );
   }
 
   if (writeProblems.length > 0) {
@@ -500,6 +506,15 @@ async function runBatch(req, depth) {
     }
   } else if (remaining > 0) {
     problems.push(`⛔ وصلت لأقصى عدد دفعات وفيه ${remaining} مستخدم لسه متبعتلهمش النهاردة.`);
+  }
+
+  // كل المستخدمين اتعالجوا بس بعضهم فشل: دفعة تانية بعد شوية تحاول معاهم (مرة واحدة بس)
+  if (remaining === 0 && failedCount > 0 && depth < MAX_RETRY_DEPTH) {
+    chained = true;
+    const retry = await triggerNextBatch(req, depth + 1, RETRY_DELAY_SECONDS);
+    if (!retry.ok) {
+      problems.push(`⛔ دفعة إعادة المحاولة متشغلتش (${escapeHtml(retry.reason)}). اضغطي Run من Vercel.`);
+    }
   }
 
   if (problems.length > 0) {
@@ -529,12 +544,16 @@ module.exports = async (req, res) => {
   const query = req.query || {};
   const depth = parseInt(query.depth || '0', 10) || 0;
   const isChained = query.chain === '1';
+  const delaySeconds = Math.min(parseInt(query.delay || '0', 10) || 0, 30); // استنى شوية قبل ما تبدأ (للإعادة)
 
   // دفعة متسلسلة: نرد فورًا ونكمل الشغل في الخلفية (عشان الدفعة اللي قبلها متستناش)
   if (isChained && waitUntil) {
     res.status(202).json({ accepted: true, depth });
     waitUntil(
-      runBatch(req, depth)
+      (async () => {
+        if (delaySeconds) await sleep(delaySeconds * 1000);
+        return runBatch(req, depth);
+      })()
         .then((result) => console.log('Cron batch done:', JSON.stringify(result)))
         .catch(async (err) => {
           console.error('Cron batch error:', err);
@@ -545,6 +564,7 @@ module.exports = async (req, res) => {
   }
 
   try {
+    if (isChained && delaySeconds) await sleep(delaySeconds * 1000);
     const result = await runBatch(req, depth);
     console.log('Cron batch done:', JSON.stringify(result));
     return res.status(200).json(result);

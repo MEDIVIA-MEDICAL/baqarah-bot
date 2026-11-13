@@ -6,6 +6,27 @@ const sheets = require('../lib/sheets');
 const telegram = require('../lib/telegram');
 const { deliverFirstPage, communityLine } = require('../lib/daily');
 
+// ملفات اختيارية: لو الملف مش مرفوع على GitHub البوت بيشتغل عادي من غيره والأمر بتاعه بس ما بيشتغلش.
+// (لازم يفضل require بالاسم الصريح عشان Vercel يضمّ الملف.)
+let rating = null; // lib/rating.js (استفتاء جودة البوت)
+try {
+  rating = require('../lib/rating');
+} catch (err) {
+  if (!err || err.code !== 'MODULE_NOT_FOUND') console.error('Failed to load lib/rating.js:', err);
+}
+let polls = null; // lib/polls.js (استفتاءات عامة: أسئلة جديدة بتكتبيها في الشيت)
+try {
+  polls = require('../lib/polls');
+} catch (err) {
+  if (!err || err.code !== 'MODULE_NOT_FOUND') console.error('Failed to load lib/polls.js:', err);
+}
+let broadcast = null; // lib/broadcast.js (رسالة للكل)
+try {
+  broadcast = require('../lib/broadcast');
+} catch (err) {
+  if (!err || err.code !== 'MODULE_NOT_FOUND') console.error('Failed to load lib/broadcast.js:', err);
+}
+
 // ---------- حد التسجيل ----------
 // أول MAX_FREE_USERS مستخدم بيدخلوا عادي. بعد كده الدخول بكود من تاب Invites في الشيت.
 // ممكن تغيّري الرقم من Vercel (متغير MAX_FREE_USERS) من غير ما تلمسي الكود.
@@ -873,6 +894,12 @@ module.exports = async (req, res) => {
       } else if (type === 'milestone') {
         const [, chosen] = parts;
         await handleMilestoneAnswer(telegramId, chatId, chosen, cq.id, messageId);
+      } else if (type === 'rate' && rating) {
+        await rating.handleCallback(cq, parts);
+      } else if (type === 'pl' && polls) {
+        await polls.handleCallback(cq, parts, isOwner(telegramId));
+      } else if (type === 'bc' && broadcast) {
+        await broadcast.handleCallback(cq, parts, isOwner(telegramId));
       } else if (type === 'reqaccess') {
         await handleAccessRequest(cq, telegramId, chatId);
       } else if (type === 'approve' || type === 'reject') {
@@ -905,6 +932,23 @@ module.exports = async (req, res) => {
     // أوامر المعاينة: شغالة لحسابك إنتي بس، وأي حد تاني بيكمل عادي في الردود اللي تحت
     const [rawCmd, cmdArg] = text.split(/\s+/);
     const cmd = rawCmd.split('@')[0].toLowerCase();
+    if (cmd === '/rate' && rating) {
+      await rating.handleRateCommand(telegramId, chatId);
+      return res.status(200).send('OK');
+    }
+    if ((cmd === '/sendrate' || cmd === '/results') && rating && isOwner(telegramId)) {
+      if (cmd === '/sendrate') await rating.handleSendCommand(chatId, cmdArg);
+      else await rating.handleResultsCommand(chatId);
+      return res.status(200).send('OK');
+    }
+    if (['/polls', '/testpoll', '/sendpoll', '/pollresults'].includes(cmd) && polls && isOwner(telegramId)) {
+      await polls.handleCommand(cmd, text.split(/\s+/).slice(1), chatId);
+      return res.status(200).send('OK');
+    }
+    if (cmd === '/broadcast' && broadcast && isOwner(telegramId)) {
+      await broadcast.handleCommand(chatId, msg);
+      return res.status(200).send('OK');
+    }
     if (cmd === '/requests' && isOwner(telegramId)) {
       await handleOwnerRequests(chatId);
       return res.status(200).send('OK');
@@ -988,6 +1032,9 @@ module.exports = async (req, res) => {
       await sendAccessMessage(chatId, text.startsWith('/') ? ACCESS_FULL_TEXT : ACCESS_INVALID_TEXT);
       return res.status(200).send('OK');
     }
+
+    // رسالة عادية منك إنتي (مثلًا بتكتبي إعلان عشان /broadcast): ما نردش عليها
+    if (isOwner(telegramId)) return res.status(200).send('OK');
 
     await telegram.sendMessage(chatId, 'اكتب /start عشان تبدأ رحلة حفظ سورة البقرة 🌿');
     return res.status(200).send('OK');
